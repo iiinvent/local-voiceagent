@@ -245,7 +245,10 @@ def wait_after_playback() -> None:
 
 def transcribe(audio: np.ndarray, model: ASRSession) -> str:
     result = model.transcribe((audio, SAMPLE_RATE), language="en")
-    return result.text.strip()
+    text = (getattr(result, "text", None) or "").strip()
+    text = text.replace("\ufeff", "")
+    text = text.translate(str.maketrans("", "", "\u200b\u200c\u200d\u2060"))
+    return text.strip()
 
 
 # ── LLM (streaming) ────────────────────────────────────────────────────────────
@@ -562,6 +565,96 @@ def save_memory_file(path: str, memory_notes: str, conversation: List[Dict]) -> 
         print(f"[Memory]: could not save {path!r} ({exc}).", flush=True)
 
 
+def _normalize_voice_command_text(text: str) -> str:
+    """Lowercase, collapse whitespace, strip punctuation for phrase matching."""
+    t = str(text).strip()
+    t = t.replace("\ufeff", "")
+    t = t.translate(str.maketrans("", "", "\u200b\u200c\u200d\u2060"))
+    t = " ".join(t.lower().split())
+    t = re.sub(r"[^\w\s]", "", t)
+    return " ".join(t.split())
+
+
+_CLEAR_MEMORY_PHRASES = tuple(
+    _normalize_voice_command_text(p)
+    for p in (
+        "Clear your memory.",
+        "Clear my memory.",
+        "Clear memory.",
+        "Clear memories.",
+        "Erase your memory.",
+        "Erase my memory.",
+        "Reset your memory.",
+        "Reset my memory.",
+        "Forget everything.",
+        "Start fresh.",
+        "Wipe your memory.",
+        "Empty your memory.",
+        "Delete your memory.",
+        "Start over.",
+        "New conversation.",
+    )
+)
+
+_MEMORY_CLEAR_RE = re.compile(
+    r"(?:"
+    r"\bclear\b.{0,48}\bmemor(?:y|ies)\b"
+    r"|\berase\b.{0,48}\bmemor(?:y|ies)\b"
+    r"|\bwipe\b.{0,48}\bmemor(?:y|ies)\b"
+    r"|\breset\b.{0,48}\bmemor(?:y|ies)\b"
+    r"|\bforget\b\s+everything\b"
+    r"|\bstart\b\s+fresh\b"
+    r"|\bempty\b.{0,24}\bmemor(?:y|ies)\b"
+    r")",
+    re.IGNORECASE,
+)
+
+_QUICK_MEMORY_CLEAR_RE = re.compile(
+    r"\bclear\s+(?:your|my)\s+memor(?:y|ies)\b"
+    r"|\bforget\s+everything\b"
+    r"|\bstart\s+fresh\b"
+    r"|\bwipe\s+(?:your|my)\s+memor(?:y|ies)\b"
+    r"|\berase\s+(?:your|my)\s+memor(?:y|ies)\b"
+    r"|\breset\s+(?:your|my)\s+memor(?:y|ies)\b"
+    r"|\bempty\s+(?:your|my)\s+memor(?:y|ies)\b"
+    r"|\bdelete\s+(?:your|my)\s+memor(?:y|ies)\b"
+    r"|\bnew\s+conversation\b"
+    r"|\bstart\s+over\b",
+    re.IGNORECASE,
+)
+
+
+def user_wants_memory_cleared(text: str) -> bool:
+    """True if the user asked to clear session / persisted memory (voice command)."""
+    if not (text and str(text).strip()):
+        return False
+    raw = str(text).strip()
+    if _QUICK_MEMORY_CLEAR_RE.search(raw):
+        return True
+    t = _normalize_voice_command_text(raw)
+    if _QUICK_MEMORY_CLEAR_RE.search(t):
+        return True
+    if any(p and p in t for p in _CLEAR_MEMORY_PHRASES):
+        return True
+    if _MEMORY_CLEAR_RE.search(raw):
+        return True
+    return bool(_MEMORY_CLEAR_RE.search(t))
+
+
+def wipe_all_agent_memory(base_system_prompt: str, memory_path: str) -> Tuple[List[Dict], str]:
+    memory_notes = ""
+    conversation: List[Dict] = [build_system_message(base_system_prompt, memory_notes)]
+    if memory_path.strip():
+        save_memory_file(memory_path, memory_notes, conversation)
+        tmp = f"{memory_path}.tmp"
+        try:
+            if os.path.isfile(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+    return conversation, memory_notes
+
+
 # ── Main loop ──────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -630,6 +723,15 @@ def main() -> None:
                 print("[No speech detected, listening again]", flush=True)
                 continue
             print(f"[You]: {user_text}", flush=True)
+
+            if user_wants_memory_cleared(user_text):
+                conversation, memory_notes = wipe_all_agent_memory(
+                    SYSTEM_PROMPT, MEMORY_FILE_PATH
+                )
+                print("[Memory]: fully cleared (conversation, compressed notes, disk).", flush=True)
+                speak("Okay, I've cleared my memory. We're starting fresh.", kokoro)
+                wait_after_playback()
+                continue
 
             # 3. Stream LLM → sentence chunks → overlapped synth+play
             conversation.append({"role": "user", "content": user_text})

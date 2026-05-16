@@ -1,7 +1,7 @@
 #!/Users/master/lk/.venv/bin/python
 """
 Continuous Voice Agent
-  STT: Qwen3-ASR via mlx-qwen3-asr (local, Apple Silicon)
+  STT: Qwen3-ASR (MLX) or faster-whisper — choose at startup (env, flag, or menu)
   LLM: OpenRouter API  — streamed
   TTS: Kokoro (local, free)  — chunked pipeline
 
@@ -12,6 +12,9 @@ Latency optimisation
 Usage:
   export OPENROUTER_API_KEY="sk-or-..."
   python3 voice_agent.py
+  python3 voice_agent.py --stt whisper
+  python3 voice_agent.py --tts openai
+  VOICE_STT_BACKEND=whisper python3 voice_agent.py
 
 Optional environment (see .env.example):
   VOICE_SILENCE_THRESHOLD, VOICE_SILENCE_SECS, VOICE_MIN_SPEECH_SECS, VOICE_MAX_RECORD_SECS
@@ -24,8 +27,14 @@ Optional environment (see .env.example):
   HF_TOKEN — Hugging Face read token (optional; higher rate limits for model downloads)
   KOKORO_REPO_ID — Kokoro weights repo on the Hub (default hexgrad/Kokoro-82M)
   Say phrases like “Clear your memory.” / “forget everything” to reset session + disk memory.
+  VOICE_STT_BACKEND — qwen | whisper (overridden by --stt; if unset and TTY, menu)
+  WHISPER_MODEL, WHISPER_DEVICE, WHISPER_COMPUTE_TYPE — faster-whisper options
+  VOICE_TTS_BACKEND — kokoro | openai | openvox (also --tts)
+  OPENVox_* — local voice API at http://127.0.0.1:8000/v1 (see OPENVox_BASE_URL)
 """
 
+import base64
+import io
 import json
 import os
 import queue
@@ -50,14 +59,20 @@ warnings.filterwarnings(
 
 import numpy as np
 import sounddevice as sd
-from typing import Iterator, Optional, List, Dict, Tuple
-from mlx_qwen3_asr.session import Session as ASRSession
-from kokoro import KPipeline
+from dataclasses import dataclass
+from typing import Iterator, Optional, List, Dict, Tuple, Callable, Any, Union, TYPE_CHECKING
+
+SampleRateSpec = Union[int, Callable[[], int]]
 import requests
+
+if TYPE_CHECKING:
+    from kokoro import KPipeline
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 OPENROUTER_API_KEY  = os.environ.get("OPENROUTER_API_KEY", "")
 OPENROUTER_MODEL    = os.environ.get("OPENROUTER_MODEL", "deepseek/deepseek-v4-flash:free")
+# OpenRouter reasoning: effort=none disables thinking tokens (best for voice latency)
+OPENROUTER_REASONING_EFFORT = os.environ.get("OPENROUTER_REASONING_EFFORT", "none").strip().lower()
 SYSTEM_PROMPT       = os.environ.get("SYSTEM_PROMPT",
     "You are Jully, my AI assistant. "
     "Keep responses concise and conversational — 1-3 sentences unless more detail is asked for. "
@@ -80,9 +95,14 @@ VOICE_LIST_DEVICES     = os.environ.get("VOICE_LIST_DEVICES", "").strip().lower(
     "1", "true", "yes", "y", "on",
 )
 
-# Qwen3-ASR STT (mlx-qwen3-asr, Apple Silicon)
+# Qwen3-ASR STT (mlx-qwen3-asr, Apple Silicon) — used when VOICE_STT_BACKEND=qwen
 # Options: "Qwen/Qwen3-ASR-0.6B" (fast) | "Qwen/Qwen3-ASR-1.7B" (accurate)
 QWEN_MODEL          = os.environ.get("QWEN_MODEL", "Qwen/Qwen3-ASR-1.7B")
+
+# faster-whisper — used when VOICE_STT_BACKEND=whisper
+WHISPER_MODEL       = os.environ.get("WHISPER_MODEL", "base.en").strip() or "base.en"
+WHISPER_DEVICE      = os.environ.get("WHISPER_DEVICE", "auto").strip() or "auto"
+WHISPER_COMPUTE_TYPE = os.environ.get("WHISPER_COMPUTE_TYPE", "default").strip() or "default"
 
 # Kokoro TTS (HF_TOKEN in env improves Hub download limits — see .env.example)
 KOKORO_REPO_ID      = os.environ.get("KOKORO_REPO_ID", "hexgrad/Kokoro-82M").strip() or "hexgrad/Kokoro-82M"
@@ -90,6 +110,35 @@ KOKORO_LANG         = os.environ.get("KOKORO_LANG", "a").strip() or "a"  # 'a' A
 KOKORO_VOICE        = os.environ.get("KOKORO_VOICE", "af_heart").strip() or "af_heart"
 KOKORO_SPEED        = float(os.environ.get("KOKORO_SPEED", "1.0"))
 KOKORO_SAMPLE_RATE  = int(os.environ.get("KOKORO_SAMPLE_RATE", "24000"))
+
+# OpenAI Speech API (or any OpenAI-compatible POST /audio/speech endpoint)
+OPENAI_SPEECH_API_KEY = (
+    os.environ.get("OPENAI_SPEECH_API_KEY", "").strip()
+    or os.environ.get("OPENAI_API_KEY", "").strip()
+)
+OPENAI_SPEECH_BASE_URL = (
+    os.environ.get("OPENAI_SPEECH_BASE_URL", "https://api.openai.com/v1").strip().rstrip("/")
+    or "https://api.openai.com/v1"
+)
+OPENAI_SPEECH_MODEL   = os.environ.get("OPENAI_SPEECH_MODEL", "tts-1").strip() or "tts-1"
+OPENAI_SPEECH_VOICE   = os.environ.get("OPENAI_SPEECH_VOICE", "alloy").strip() or "alloy"
+OPENAI_SPEECH_FORMAT  = os.environ.get("OPENAI_SPEECH_FORMAT", "pcm").strip().lower() or "pcm"
+OPENAI_SPEECH_SPEED   = float(os.environ.get("OPENAI_SPEECH_SPEED", "1.0"))
+OPENAI_SPEECH_SAMPLE_RATE = int(os.environ.get("OPENAI_SPEECH_SAMPLE_RATE", "24000"))
+
+# OpenVox local voice API (OpenAI-style paths under /v1)
+OPENVox_BASE_URL = (
+    os.environ.get("OPENVox_BASE_URL", "http://127.0.0.1:8000/v1").strip().rstrip("/")
+    or "http://127.0.0.1:8000/v1"
+)
+OPENVox_MODEL     = os.environ.get("OPENVox_MODEL", "").strip()
+OPENVox_LANGUAGE  = os.environ.get("OPENVox_LANGUAGE", "en").strip() or "en"
+OPENVox_VOICE     = os.environ.get("OPENVox_VOICE", "").strip()
+OPENVox_STREAM    = os.environ.get("OPENVox_STREAM", "").strip().lower() in (
+    "1", "true", "yes", "y", "on",
+)
+OPENVox_429_WAIT  = float(os.environ.get("OPENVox_429_WAIT", "2.0"))
+OPENVox_MAX_RETRIES = max(1, int(os.environ.get("OPENVox_MAX_RETRIES", "12")))
 
 # Chunking — how aggressively to split the LLM stream for early playback
 # Splits at sentence-ending punctuation followed by whitespace.
@@ -99,6 +148,8 @@ SPLIT_PATTERN       = re.compile(r'(?<=[.!?;])\s+')
 # LLM streaming timeouts (seconds)
 LLM_FIRST_TOKEN_TIMEOUT = 30   # give up if no token arrives within this long
 LLM_INTER_TOKEN_TIMEOUT = 15   # give up if gap between tokens exceeds this
+LLM_RETRY_ATTEMPTS      = max(1, int(os.environ.get("VOICE_LLM_RETRY_ATTEMPTS", "3")))
+LLM_RETRY_BASE_SECS     = float(os.environ.get("VOICE_LLM_RETRY_BASE_SECS", "2"))
 
 # Conversation context & memory (env-tunable)
 MAX_HISTORY_PAIRS       = max(1, int(os.environ.get("VOICE_MAX_HISTORY_PAIRS", "24")))
@@ -262,12 +313,139 @@ def wait_after_playback() -> None:
 
 # ── STT ────────────────────────────────────────────────────────────────────────
 
-def transcribe(audio: np.ndarray, model: ASRSession) -> str:
+
+def _parse_stt_argv() -> Optional[str]:
+    """Read --stt / --asr from argv (does not mutate argv)."""
+    args = sys.argv[1:]
+    for i, a in enumerate(args):
+        if a in ("--stt", "--asr") and i + 1 < len(args):
+            return args[i + 1].strip()
+        if a.startswith("--stt=") or a.startswith("--asr="):
+            _, _, rest = a.partition("=")
+            return rest.strip()
+    return None
+
+
+def _normalize_stt_backend(raw: Optional[str]) -> Optional[str]:
+    if raw is None or not str(raw).strip():
+        return None
+    s = str(raw).strip().lower()
+    if s in ("qwen", "qwen3", "mlx", "qwen-asr", "qwen_asr"):
+        return "qwen"
+    if s in ("whisper", "faster-whisper", "faster_whisper", "fw", "openai-whisper"):
+        return "whisper"
+    return None
+
+
+def resolve_stt_backend() -> str:
+    """
+    Pick STT engine: CLI --stt/--asr, then VOICE_STT_BACKEND, then interactive if TTY, else qwen.
+    """
+    cli = _parse_stt_argv()
+    if cli is not None:
+        b = _normalize_stt_backend(cli)
+        if b is None:
+            sys.exit(f"Invalid --stt/--asr={cli!r}. Use qwen or whisper.")
+        return b
+
+    env_raw = os.environ.get("VOICE_STT_BACKEND", "").strip()
+    if env_raw:
+        b = _normalize_stt_backend(env_raw)
+        if b is None:
+            sys.exit(f"Invalid VOICE_STT_BACKEND={env_raw!r}. Use qwen or whisper.")
+        return b
+
+    if sys.stdin.isatty() and sys.stdout.isatty():
+        print(
+            "\nSelect speech-to-text engine:\n"
+            "  1) Qwen3-ASR (MLX on Apple Silicon, default)\n"
+            "  2) Faster-Whisper (CPU/GPU via CTranslate2)\n",
+            end="",
+            flush=True,
+        )
+        choice = input("Enter 1 or 2 [1]: ").strip() or "1"
+        if choice in ("2", "w", "W", "whisper", "Whisper"):
+            return "whisper"
+        return "qwen"
+
+    return "qwen"
+
+
+def transcribe_qwen(model: Any, audio: np.ndarray) -> str:
     result = model.transcribe((audio, SAMPLE_RATE), language="en")
-    return result.text.strip()
+    text = (getattr(result, "text", None) or "").strip()
+    text = text.replace("\ufeff", "")
+    text = text.translate(str.maketrans("", "", "\u200b\u200c\u200d\u2060"))
+    return text.strip()
+
+
+def transcribe_whisper(model: Any, audio: np.ndarray) -> str:
+    arr = np.asarray(audio, dtype=np.float32).reshape(-1)
+    segments, _info = model.transcribe(
+        arr,
+        language="en",
+        beam_size=5,
+        vad_filter=False,
+    )
+    text = "".join(seg.text for seg in segments).strip()
+    text = text.replace("\ufeff", "")
+    text = text.translate(str.maketrans("", "", "\u200b\u200c\u200d\u2060"))
+    return text.strip()
+
+
+def load_stt_transcriber(backend: str) -> Tuple[str, Callable[[np.ndarray], str]]:
+    """Load the chosen STT model; return (label, transcribe_fn)."""
+    if backend == "qwen":
+        from mlx_qwen3_asr.session import Session as ASRSession
+
+        print(f"Loading Qwen3-ASR ({QWEN_MODEL}) ...", flush=True)
+        qwen = ASRSession(QWEN_MODEL)
+        label = f"Qwen3-ASR ({QWEN_MODEL})"
+        return label, lambda a: transcribe_qwen(qwen, a)
+
+    try:
+        from faster_whisper import WhisperModel
+    except ImportError as exc:
+        sys.exit(
+            "faster-whisper is not installed. Install with:\n"
+            "  pip install faster-whisper\n"
+            f" ({exc})"
+        )
+
+    dev = WHISPER_DEVICE
+    if dev.lower() in ("auto", "default", ""):
+        dev = "auto"
+    ctype = WHISPER_COMPUTE_TYPE
+    if ctype.lower() in ("auto", "default", ""):
+        ctype = "default"
+
+    print(
+        f"Loading Faster-Whisper (model={WHISPER_MODEL!r}, device={dev!r}, compute_type={ctype!r}) ...",
+        flush=True,
+    )
+    whisper = WhisperModel(WHISPER_MODEL, device=dev, compute_type=ctype)
+    label = f"Faster-Whisper ({WHISPER_MODEL})"
+    return label, lambda a: transcribe_whisper(whisper, a)
 
 
 # ── LLM (streaming) ────────────────────────────────────────────────────────────
+
+
+def _openrouter_reasoning_body() -> Optional[Dict[str, Any]]:
+    """Build OpenRouter `reasoning` object; default effort=none (reasoning off)."""
+    raw = OPENROUTER_REASONING_EFFORT
+    if raw in ("off", "false", "0", "no", "disable", "disabled", "none"):
+        return {"effort": "none"}
+    if raw in ("exclude", "hidden"):
+        return {"exclude": True}
+    if raw in ("xhigh", "high", "medium", "low", "minimal"):
+        return {"effort": raw}
+    if raw.isdigit():
+        return {"max_tokens": int(raw)}
+    if raw in ("on", "true", "1", "default", "medium"):
+        return {"enabled": True}
+    return {"effort": raw}
+
 
 def stream_llm(
     messages: List[Dict],
@@ -285,24 +463,46 @@ def stream_llm(
 
     def _fetch() -> None:
         try:
-            resp = requests.post(
-                "https://openrouter.ai/api/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                    "HTTP-Referer": "https://voice-agent.local",
-                    "X-Title": "Voice Agent",
-                },
-                json={
-                    "model": model,
-                    "messages": messages,
-                    "max_tokens": max_tokens,
-                    "temperature": 0.7,
-                    "stream": True,
-                },
-                stream=True,
-                timeout=30,
-            )
+            url = "https://openrouter.ai/api/v1/chat/completions"
+            headers = {
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": "https://voice-agent.local",
+                "X-Title": "Voice Agent",
+            }
+            body: Dict[str, Any] = {
+                "model": model,
+                "messages": messages,
+                "max_tokens": max_tokens,
+                "temperature": 0.7,
+                "stream": True,
+            }
+            reasoning = _openrouter_reasoning_body()
+            if reasoning is not None:
+                body["reasoning"] = reasoning
+            resp = None
+            for attempt in range(LLM_RETRY_ATTEMPTS):
+                resp = requests.post(
+                    url, headers=headers, json=body, stream=True, timeout=30,
+                )
+                if resp.status_code == 429 and attempt + 1 < LLM_RETRY_ATTEMPTS:
+                    wait = LLM_RETRY_BASE_SECS * (2 ** attempt)
+                    print(
+                        f"[LLM]: rate limited (429) on {model!r}; "
+                        f"retry {attempt + 2}/{LLM_RETRY_ATTEMPTS} in {wait:.0f}s ...",
+                        flush=True,
+                    )
+                    time.sleep(wait)
+                    continue
+                break
+            assert resp is not None
+            if resp.status_code == 429:
+                print(
+                    "[LLM]: OpenRouter returned 429 Too Many Requests. "
+                    "Free models are often rate-limited — wait a minute, set OPENROUTER_MODEL "
+                    "to another model, or add credits at openrouter.ai.",
+                    flush=True,
+                )
             resp.raise_for_status()
             for line in resp.iter_lines():
                 if not line:
@@ -312,8 +512,10 @@ def stream_llm(
                     if data.strip() == b"[DONE]":
                         break
                     try:
-                        obj   = json.loads(data)
-                        delta = obj["choices"][0]["delta"].get("content") or ""
+                        obj = json.loads(data)
+                        delta_obj = obj["choices"][0].get("delta") or {}
+                        # Only speak final content — never reasoning / thinking tokens
+                        delta = delta_obj.get("content") or ""
                         if delta:
                             token_q.put(delta)
                     except (json.JSONDecodeError, KeyError, IndexError):
@@ -368,14 +570,364 @@ def _to_numpy(audio) -> np.ndarray:
     return audio.numpy() if hasattr(audio, "numpy") else np.asarray(audio)
 
 
-def speak_chunked(sentence_iter: Iterator[str], pipeline: KPipeline) -> str:
+def ensure_spacy_english_model() -> None:
+    """Kokoro/misaki needs en_core_web_sm; download once if missing (can take a minute)."""
+    try:
+        import spacy
+    except ImportError as exc:
+        sys.exit(f"spaCy is required for Kokoro TTS but is not installed ({exc}).")
+
+    name = "en_core_web_sm"
+    if spacy.util.is_package(name):
+        return
+    print(
+        f"[Setup]: downloading spaCy model {name!r} (required for Kokoro; first time only) ...",
+        flush=True,
+    )
+    try:
+        spacy.cli.download(name)
+    except Exception as exc:
+        sys.exit(
+            f"Could not install spaCy model {name!r}: {exc}\n"
+            f"  Run: {sys.executable} -m spacy download {name}"
+        )
+
+
+def load_kokoro_pipeline() -> "KPipeline":
+    """Load Kokoro TTS (imports torch/spacy on first call — may take 30–90s)."""
+    ensure_spacy_english_model()
+    print(
+        "Loading Kokoro TTS (torch + spaCy; first run can take up to ~2 min) ...",
+        flush=True,
+    )
+    from kokoro import KPipeline
+
+    return KPipeline(lang_code=KOKORO_LANG, repo_id=KOKORO_REPO_ID)
+
+
+def _kokoro_synthesize(pipeline: "KPipeline", text: str) -> np.ndarray:
+    chunks: List[np.ndarray] = []
+    for _, _, audio in pipeline(text, voice=KOKORO_VOICE, speed=KOKORO_SPEED):
+        if audio is not None:
+            chunks.append(_to_numpy(audio))
+    if not chunks:
+        return np.array([], dtype=np.float32)
+    return np.concatenate(chunks)
+
+
+def openai_speech_synthesize(text: str) -> Tuple[np.ndarray, int]:
+    """
+    Call OpenAI-compatible POST {base_url}/audio/speech.
+    Returns (float32 mono audio, sample_rate).
+    """
+    if not text.strip():
+        return np.array([], dtype=np.float32), OPENAI_SPEECH_SAMPLE_RATE
+    if not OPENAI_SPEECH_API_KEY:
+        raise ValueError(
+            "OPENAI_SPEECH_API_KEY or OPENAI_API_KEY is required for OpenAI TTS "
+            "(set VOICE_TTS_BACKEND=openai)."
+        )
+
+    url = f"{OPENAI_SPEECH_BASE_URL}/audio/speech"
+    payload: Dict[str, Any] = {
+        "model": OPENAI_SPEECH_MODEL,
+        "input": text,
+        "voice": OPENAI_SPEECH_VOICE,
+        "response_format": OPENAI_SPEECH_FORMAT,
+    }
+    if OPENAI_SPEECH_SPEED != 1.0:
+        payload["speed"] = OPENAI_SPEECH_SPEED
+
+    resp = requests.post(
+        url,
+        headers={
+            "Authorization": f"Bearer {OPENAI_SPEECH_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json=payload,
+        timeout=120,
+    )
+    resp.raise_for_status()
+
+    if OPENAI_SPEECH_FORMAT == "pcm":
+        pcm = np.frombuffer(resp.content, dtype=np.int16)
+        audio = pcm.astype(np.float32) / 32768.0
+        return audio, OPENAI_SPEECH_SAMPLE_RATE
+
+    import io
+    import soundfile as sf
+
+    data, sr = sf.read(io.BytesIO(resp.content), dtype="float32", always_2d=True)
+    mono = data.mean(axis=1) if data.ndim > 1 else data.reshape(-1)
+    return mono.astype(np.float32), int(sr)
+
+
+def _wav_bytes_to_mono_float(wav_bytes: bytes) -> Tuple[np.ndarray, int]:
+    import soundfile as sf
+
+    data, sr = sf.read(io.BytesIO(wav_bytes), dtype="float32", always_2d=True)
+    mono = data.mean(axis=1) if data.size else data.reshape(-1)
+    return mono.astype(np.float32), int(sr)
+
+
+def _json_list_items(payload: Any, id_keys: Tuple[str, ...] = ("id", "name", "code")) -> List[str]:
+    """Extract string ids from assorted list/dict API response shapes."""
+    if payload is None:
+        return []
+    if isinstance(payload, str):
+        return [payload]
+    if isinstance(payload, list):
+        out: List[str] = []
+        for item in payload:
+            if isinstance(item, str):
+                out.append(item)
+            elif isinstance(item, dict):
+                for key in id_keys:
+                    if item.get(key):
+                        out.append(str(item[key]))
+                        break
+        return out
+    if isinstance(payload, dict):
+        for key in ("data", "items", "models", "languages", "voices", "results"):
+            if key in payload:
+                return _json_list_items(payload[key], id_keys)
+    return []
+
+
+class OpenVoxTTS:
+    """
+    OpenVox local voice API: discover model, warm load, resolve language/voice,
+    then POST /audio/speech (WAV or SSE stream).
+    """
+
+    def __init__(self) -> None:
+        self.base_url = OPENVox_BASE_URL
+        self.model = OPENVox_MODEL
+        self.language = OPENVox_LANGUAGE
+        self.voice = OPENVox_VOICE or None
+        self.use_stream = OPENVox_STREAM
+        self.sample_rate = 24000
+        self._models_loaded: set[str] = set()
+        self.label = "OpenVox"
+
+    def setup(self) -> bool:
+        """Probe API, pick model/language/voice, warm-load model. Returns False if unavailable."""
+        try:
+            resp = self._request("GET", "/models", timeout=15)
+            resp.raise_for_status()
+            models = _json_list_items(resp.json())
+            if not models:
+                print("[OpenVox]: GET /models returned no models.", flush=True)
+                return False
+            if not self.model:
+                self.model = models[0]
+                if len(models) > 1:
+                    print(f"[OpenVox]: models available: {', '.join(models)}", flush=True)
+            elif self.model not in models:
+                print(
+                    f"[OpenVox]: OPENVox_MODEL={self.model!r} not in {models}; using {models[0]!r}.",
+                    flush=True,
+                )
+                self.model = models[0]
+
+            self._warm_load_model(self.model)
+            self._resolve_language_and_voice()
+            mode = "SSE stream" if self.use_stream else "WAV"
+            self.label = f"OpenVox ({self.model}/{self.language}/{self.voice}, {mode})"
+            print(f"[OpenVox]: ready — {self.label}", flush=True)
+            return True
+        except requests.RequestException as exc:
+            print(
+                f"[OpenVox]: cannot reach voice API at {self.base_url!r} ({exc}).",
+                flush=True,
+            )
+            return False
+
+    def _url(self, path: str) -> str:
+        return f"{self.base_url}/{path.lstrip('/')}"
+
+    def _request(self, method: str, path: str, **kwargs: Any) -> requests.Response:
+        url = self._url(path)
+        timeout = kwargs.pop("timeout", 120)
+        last: Optional[requests.Response] = None
+        for attempt in range(OPENVox_MAX_RETRIES):
+            resp = requests.request(method, url, timeout=timeout, **kwargs)
+            last = resp
+            if resp.status_code != 429:
+                return resp
+            wait = OPENVox_429_WAIT * (attempt + 1)
+            print(
+                f"[OpenVox]: server busy (429); waiting {wait:.0f}s before retry "
+                f"({attempt + 1}/{OPENVox_MAX_RETRIES}) ...",
+                flush=True,
+            )
+            time.sleep(wait)
+        assert last is not None
+        return last
+
+    def _warm_load_model(self, model_id: str) -> None:
+        if model_id in self._models_loaded:
+            return
+        print(f"[OpenVox]: loading model {model_id!r} ...", flush=True)
+        resp = self._request("POST", f"/models/{model_id}/load", timeout=300)
+        resp.raise_for_status()
+        self._models_loaded.add(model_id)
+
+    def _resolve_language_and_voice(self) -> None:
+        assert self.model
+        resp = self._request("GET", f"/models/{self.model}/languages", timeout=30)
+        resp.raise_for_status()
+        languages = _json_list_items(resp.json())
+        if not languages:
+            languages = [self.language]
+        if self.language not in languages:
+            print(
+                f"[OpenVox]: language {self.language!r} not in {languages}; using {languages[0]!r}.",
+                flush=True,
+            )
+            self.language = languages[0]
+
+        self._refresh_voice(preferred=self.voice)
+
+    def _refresh_voice(self, preferred: Optional[str] = None) -> None:
+        assert self.model
+        resp = self._request(
+            "GET",
+            f"/models/{self.model}/voices",
+            params={"language": self.language},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        voices = _json_list_items(resp.json())
+        if not voices:
+            raise ValueError(
+                f"No voices for model={self.model!r} language={self.language!r}"
+            )
+        pick = preferred if preferred and preferred in voices else voices[0]
+        if preferred and preferred not in voices:
+            print(
+                f"[OpenVox]: voice {preferred!r} not available; using {pick!r} "
+                f"(choices: {', '.join(voices[:8])}{'…' if len(voices) > 8 else ''}).",
+                flush=True,
+            )
+        self.voice = pick
+
+    def synthesize(self, text: str) -> np.ndarray:
+        if not text.strip():
+            return np.array([], dtype=np.float32)
+        assert self.model and self.voice
+        self._warm_load_model(self.model)
+        try:
+            if self.use_stream:
+                return self._synthesize_stream(text)
+            return self._synthesize_wav(text)
+        except requests.HTTPError as exc:
+            if exc.response is not None and exc.response.status_code in (400, 404, 422):
+                self._refresh_voice(preferred=None)
+                if self.use_stream:
+                    return self._synthesize_stream(text)
+                return self._synthesize_wav(text)
+            raise
+
+    def _speech_body(self, text: str, *, stream: bool) -> Dict[str, Any]:
+        body: Dict[str, Any] = {
+            "model": self.model,
+            "input": text,
+            "language": self.language,
+            "voice": self.voice,
+        }
+        if stream:
+            body["stream"] = True
+        else:
+            body["response_format"] = "wav"
+        return body
+
+    def _synthesize_wav(self, text: str) -> np.ndarray:
+        resp = self._request(
+            "POST",
+            "/audio/speech",
+            headers={"Content-Type": "application/json"},
+            json=self._speech_body(text, stream=False),
+            timeout=300,
+        )
+        resp.raise_for_status()
+        audio, sr = _wav_bytes_to_mono_float(resp.content)
+        self.sample_rate = sr
+        return audio
+
+    def _synthesize_stream(self, text: str) -> np.ndarray:
+        resp = self._request(
+            "POST",
+            "/audio/speech",
+            headers={"Content-Type": "application/json", "Accept": "text/event-stream"},
+            json=self._speech_body(text, stream=True),
+            stream=True,
+            timeout=300,
+        )
+        resp.raise_for_status()
+        parts: List[np.ndarray] = []
+        event_name: Optional[str] = None
+        for raw in resp.iter_lines(decode_unicode=True):
+            if raw is None:
+                continue
+            line = raw.strip() if isinstance(raw, str) else raw.decode("utf-8", errors="replace").strip()
+            if not line:
+                continue
+            if line.startswith("event:"):
+                event_name = line[6:].strip()
+                continue
+            if not line.startswith("data:"):
+                continue
+            data_str = line[5:].strip()
+            if not data_str or data_str == "[DONE]":
+                continue
+            try:
+                obj = json.loads(data_str)
+            except json.JSONDecodeError:
+                continue
+            ev = event_name or obj.get("type") or obj.get("event")
+            if ev in ("audio.chunk", "response.audio.chunk"):
+                chunk_obj = obj.get("data") if isinstance(obj.get("data"), dict) else obj
+                b64 = None
+                if isinstance(chunk_obj, dict):
+                    b64 = chunk_obj.get("audio") or chunk_obj.get("data")
+                if not b64:
+                    continue
+                wav_bytes = base64.b64decode(b64)
+                audio, sr = _wav_bytes_to_mono_float(wav_bytes)
+                self.sample_rate = sr
+                parts.append(audio)
+            event_name = None
+        if not parts:
+            return np.array([], dtype=np.float32)
+        return np.concatenate(parts)
+
+
+def _playback_sample_rate(sample_rate: SampleRateSpec) -> int:
+    return sample_rate() if callable(sample_rate) else sample_rate
+
+
+def _speak_line(
+    text: str,
+    synthesize: Callable[[str], np.ndarray],
+    sample_rate: SampleRateSpec,
+) -> None:
+    print(f"[Assistant]: {text}", flush=True)
+    audio = synthesize(text)
+    if audio.size:
+        sd.play(audio, samplerate=_playback_sample_rate(sample_rate), blocking=True)
+
+
+def speak_chunked(
+    sentence_iter: Iterator[str],
+    synthesize: Callable[[str], np.ndarray],
+    sample_rate: SampleRateSpec,
+) -> str:
     """
     Pipeline TTS synthesis with playback so they overlap:
       synth thread processes sentence N+1 while main thread plays sentence N.
 
     Returns the full assistant reply text for conversation history.
-    Raises on LLM stream failure, Kokoro failure, or playback queue timeout
-    (caller should roll back the pending user message).
     """
     audio_q: "queue.Queue[Optional[np.ndarray]]" = queue.Queue(maxsize=3)
     reply_parts: List[str] = []
@@ -386,17 +938,14 @@ def speak_chunked(sentence_iter: Iterator[str], pipeline: KPipeline) -> str:
             for sentence in sentence_iter:
                 reply_parts.append(sentence)
                 print(sentence, end=" ", flush=True)
-                chunks: List[np.ndarray] = []
-                for _, _, audio in pipeline(sentence, voice=KOKORO_VOICE, speed=KOKORO_SPEED):
-                    if audio is not None:
-                        chunks.append(_to_numpy(audio))
-                if chunks:
-                    audio_q.put(np.concatenate(chunks))
+                audio = synthesize(sentence)
+                if audio.size:
+                    audio_q.put(audio)
         except Exception as e:
             synth_error[0] = e
             print(f"\n[TTS / stream error]: {e}", flush=True)
         finally:
-            audio_q.put(None)  # sentinel — always sent, even on exception
+            audio_q.put(None)
 
     print("[Assistant]: ", end="", flush=True)
     synth_thread = threading.Thread(target=synth_worker, daemon=True)
@@ -413,7 +962,7 @@ def speak_chunked(sentence_iter: Iterator[str], pipeline: KPipeline) -> str:
             break
         if chunk_audio is None:
             break
-        sd.play(chunk_audio, samplerate=KOKORO_SAMPLE_RATE, blocking=True)
+        sd.play(chunk_audio, samplerate=_playback_sample_rate(sample_rate), blocking=True)
 
     synth_thread.join(timeout=30)
     err = synth_error[0]
@@ -423,15 +972,161 @@ def speak_chunked(sentence_iter: Iterator[str], pipeline: KPipeline) -> str:
     return " ".join(reply_parts)
 
 
-def speak(text: str, pipeline: KPipeline) -> None:
-    """Simple (non-streaming) TTS for greetings / one-liners."""
-    print(f"[Assistant]: {text}", flush=True)
-    chunks: List[np.ndarray] = []
-    for _, _, audio in pipeline(text, voice=KOKORO_VOICE, speed=KOKORO_SPEED):
-        if audio is not None:
-            chunks.append(_to_numpy(audio))
-    if chunks:
-        sd.play(np.concatenate(chunks), samplerate=KOKORO_SAMPLE_RATE, blocking=True)
+@dataclass
+class TTSEngine:
+    """Text-to-speech backend (Kokoro, OpenAI Speech API, or OpenVox)."""
+    label: str
+    sample_rate: int
+    speak: Callable[[str], None]
+    speak_chunked: Callable[[Iterator[str]], str]
+
+
+def load_text_only_tts(reason: str) -> TTSEngine:
+    """Fallback when local/cloud TTS is unavailable — text replies only."""
+    _warned = False
+
+    def _maybe_warn() -> None:
+        nonlocal _warned
+        if not _warned:
+            print(f"[TTS]: {reason}", flush=True)
+            _warned = True
+
+    def speak(text: str) -> None:
+        print(f"[Assistant]: {text}", flush=True)
+        _maybe_warn()
+
+    def speak_chunked(sentence_iter: Iterator[str]) -> str:
+        print("[Assistant]: ", end="", flush=True)
+        parts: List[str] = []
+        for sentence in sentence_iter:
+            parts.append(sentence)
+            print(sentence, end=" ", flush=True)
+        print(flush=True)
+        _maybe_warn()
+        return " ".join(parts)
+
+    return TTSEngine(
+        label="text-only (no TTS)",
+        sample_rate=24000,
+        speak=speak,
+        speak_chunked=speak_chunked,
+    )
+
+
+def _parse_tts_argv() -> Optional[str]:
+    args = sys.argv[1:]
+    for i, a in enumerate(args):
+        if a in ("--tts",) and i + 1 < len(args):
+            return args[i + 1].strip()
+        if a.startswith("--tts="):
+            _, _, rest = a.partition("=")
+            return rest.strip()
+    return None
+
+
+def _normalize_tts_backend(raw: Optional[str]) -> Optional[str]:
+    if raw is None or not str(raw).strip():
+        return None
+    s = str(raw).strip().lower()
+    if s in ("kokoro", "local"):
+        return "kokoro"
+    if s in ("openai", "speech", "openai-speech", "openai_speech", "api"):
+        return "openai"
+    if s in ("openvox", "vox", "local-api", "local_api"):
+        return "openvox"
+    return None
+
+
+def resolve_tts_backend() -> str:
+    """CLI --tts, then VOICE_TTS_BACKEND, then interactive menu if TTY, else kokoro."""
+    cli = _parse_tts_argv()
+    if cli is not None:
+        b = _normalize_tts_backend(cli)
+        if b is None:
+            sys.exit(f"Invalid --tts={cli!r}. Use kokoro, openai, or openvox.")
+        return b
+
+    env_raw = os.environ.get("VOICE_TTS_BACKEND", "").strip()
+    if env_raw:
+        b = _normalize_tts_backend(env_raw)
+        if b is None:
+            sys.exit(f"Invalid VOICE_TTS_BACKEND={env_raw!r}. Use kokoro, openai, or openvox.")
+        return b
+
+    if sys.stdin.isatty() and sys.stdout.isatty():
+        print(
+            "\nSelect text-to-speech engine:\n"
+            "  1) Kokoro (local MLX, default)\n"
+            "  2) OpenAI Speech API (cloud)\n"
+            "  3) OpenVox (local API at 127.0.0.1:8000)\n",
+            end="",
+            flush=True,
+        )
+        choice = input("Enter 1, 2, or 3 [1]: ").strip() or "1"
+        if choice in ("3", "v", "V", "openvox", "vox"):
+            return "openvox"
+        if choice in ("2", "o", "O", "openai", "speech"):
+            return "openai"
+        return "kokoro"
+
+    return "kokoro"
+
+
+def load_tts_engine(backend: str) -> TTSEngine:
+    if backend == "openvox":
+        print(f"Connecting to OpenVox at {OPENVox_BASE_URL} ...", flush=True)
+        client = OpenVoxTTS()
+        if not client.setup():
+            return load_text_only_tts(
+                "Local OpenVox voice output is unavailable; continuing in text-only mode."
+            )
+        sr = client.sample_rate
+
+        def _synth(text: str) -> np.ndarray:
+            return client.synthesize(text)
+
+        return TTSEngine(
+            label=client.label,
+            sample_rate=sr,
+            speak=lambda t: _speak_line(t, _synth, lambda: client.sample_rate),
+            speak_chunked=lambda it: speak_chunked(it, _synth, lambda: client.sample_rate),
+        )
+
+    if backend == "openai":
+        print(
+            f"Using OpenAI Speech API ({OPENAI_SPEECH_BASE_URL}, "
+            f"model={OPENAI_SPEECH_MODEL!r}, voice={OPENAI_SPEECH_VOICE!r}) ...",
+            flush=True,
+        )
+        if not OPENAI_SPEECH_API_KEY:
+            sys.exit(
+                "Error: OpenAI TTS requires OPENAI_SPEECH_API_KEY or OPENAI_API_KEY.\n"
+                "  export OPENAI_API_KEY='sk-...'\n"
+                "  # optional custom host:\n"
+                "  export OPENAI_SPEECH_BASE_URL='https://api.openai.com/v1'"
+            )
+
+        def _synth(text: str) -> np.ndarray:
+            audio, _sr = openai_speech_synthesize(text)
+            return audio
+
+        sr = OPENAI_SPEECH_SAMPLE_RATE
+        label = f"OpenAI Speech ({OPENAI_SPEECH_MODEL}/{OPENAI_SPEECH_VOICE})"
+        return TTSEngine(
+            label=label,
+            sample_rate=sr,
+            speak=lambda t: _speak_line(t, _synth, sr),
+            speak_chunked=lambda it: speak_chunked(it, _synth, sr),
+        )
+
+    pipeline = load_kokoro_pipeline()
+    synth = lambda t: _kokoro_synthesize(pipeline, t)
+    return TTSEngine(
+        label=f"Kokoro ({KOKORO_VOICE})",
+        sample_rate=KOKORO_SAMPLE_RATE,
+        speak=lambda t: _speak_line(t, synth, KOKORO_SAMPLE_RATE),
+        speak_chunked=lambda it: speak_chunked(it, synth, KOKORO_SAMPLE_RATE),
+    )
 
 
 # ── Conversation helpers ───────────────────────────────────────────────────────
@@ -598,31 +1293,107 @@ def pop_pending_user_turn(conversation: List[Dict]) -> None:
         conversation.pop()
 
 
-_CLEAR_MEMORY_PHRASES = (
-    "Clear your memory.",
-    "Clear my memory.",
-    "Clear memory.",
-    "Erase your memory.",
-    "Erase my memory.",
-    "Reset your memory.",
-    "Reset my memory.",
-    "Forget everything.",
-    "Start fresh.",
-    "Wipe your memory.",
+def _normalize_voice_command_text(text: str) -> str:
+    """Lowercase, collapse whitespace, strip punctuation for phrase matching."""
+    t = str(text).strip()
+    t = t.replace("\ufeff", "")
+    t = t.translate(str.maketrans("", "", "\u200b\u200c\u200d\u2060"))
+    t = " ".join(t.lower().split())
+    t = re.sub(r"[^\w\s]", "", t)
+    return " ".join(t.split())
+
+
+_CLEAR_MEMORY_PHRASES = tuple(
+    _normalize_voice_command_text(p)
+    for p in (
+        "Clear your memory.",
+        "Clear my memory.",
+        "Clear memory.",
+        "Clear memories.",
+        "Erase your memory.",
+        "Erase my memory.",
+        "Reset your memory.",
+        "Reset my memory.",
+        "Forget everything.",
+        "Start fresh.",
+        "Wipe your memory.",
+        "Empty your memory.",
+        "Delete your memory.",
+        "Start over.",
+        "New conversation.",
+    )
+)
+
+# STT variants: words between "clear" and "memory"
+_MEMORY_CLEAR_RE = re.compile(
+    r"(?:"
+    r"\bclear\b.{0,48}\bmemor(?:y|ies)\b"
+    r"|\berase\b.{0,48}\bmemor(?:y|ies)\b"
+    r"|\bwipe\b.{0,48}\bmemor(?:y|ies)\b"
+    r"|\breset\b.{0,48}\bmemor(?:y|ies)\b"
+    r"|\bforget\b\s+everything\b"
+    r"|\bstart\b\s+fresh\b"
+    r"|\bempty\b.{0,24}\bmemor(?:y|ies)\b"
+    r")",
+    re.IGNORECASE,
+)
+
+# Runs first on raw STT text — catches normal wording even if normalize would change tokenization.
+_QUICK_MEMORY_CLEAR_RE = re.compile(
+    r"\bclear\s+(?:your|my)\s+memor(?:y|ies)\b"
+    r"|\bforget\s+everything\b"
+    r"|\bstart\s+fresh\b"
+    r"|\bwipe\s+(?:your|my)\s+memor(?:y|ies)\b"
+    r"|\berase\s+(?:your|my)\s+memor(?:y|ies)\b"
+    r"|\breset\s+(?:your|my)\s+memor(?:y|ies)\b"
+    r"|\bempty\s+(?:your|my)\s+memor(?:y|ies)\b"
+    r"|\bdelete\s+(?:your|my)\s+memor(?:y|ies)\b"
+    r"|\bnew\s+conversation\b"
+    r"|\bstart\s+over\b",
+    re.IGNORECASE,
 )
 
 
 def user_wants_memory_cleared(text: str) -> bool:
     """True if the user asked to clear session / persisted memory (voice command)."""
-    t = " ".join(text.lower().split())
-    t = re.sub(r"[^\w\s]", "", t)
-    t = " ".join(t.split())
-    return any(p in t for p in _CLEAR_MEMORY_PHRASES)
+    if not (text and str(text).strip()):
+        return False
+    raw = str(text).strip()
+    if _QUICK_MEMORY_CLEAR_RE.search(raw):
+        return True
+    t = _normalize_voice_command_text(raw)
+    if _QUICK_MEMORY_CLEAR_RE.search(t):
+        return True
+    if any(p and p in t for p in _CLEAR_MEMORY_PHRASES):
+        return True
+    if _MEMORY_CLEAR_RE.search(raw):
+        return True
+    return bool(_MEMORY_CLEAR_RE.search(t))
+
+
+def wipe_all_agent_memory(base_system_prompt: str, memory_path: str) -> Tuple[List[Dict], str]:
+    """
+    Reset conversation and compressed notes to a clean system-only state.
+    When memory_path is set, overwrites the JSON file with empty memory_notes and turns.
+    """
+    memory_notes = ""
+    conversation: List[Dict] = [build_system_message(base_system_prompt, memory_notes)]
+    if memory_path.strip():
+        save_memory_file(memory_path, memory_notes, conversation)
+        tmp = f"{memory_path}.tmp"
+        try:
+            if os.path.isfile(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+    return conversation, memory_notes
 
 
 # ── Main loop ──────────────────────────────────────────────────────────────────
 
 def main() -> None:
+    print("Voice agent starting ...", flush=True)
+
     if not OPENROUTER_API_KEY:
         sys.exit(
             "Error: OPENROUTER_API_KEY is not set.\n"
@@ -640,11 +1411,13 @@ def main() -> None:
 
     print(f"Using audio input device: {describe_default_input()}", flush=True)
 
-    print(f"Loading Qwen3-ASR ({QWEN_MODEL}) ...", flush=True)
-    asr = ASRSession(QWEN_MODEL)
+    stt_backend = resolve_stt_backend()
+    stt_label, stt_transcribe = load_stt_transcriber(stt_backend)
+    print(f"Using STT: {stt_label}", flush=True)
 
-    print("Loading Kokoro TTS ...", flush=True)
-    kokoro = KPipeline(lang_code=KOKORO_LANG, repo_id=KOKORO_REPO_ID)
+    tts_backend = resolve_tts_backend()
+    tts = load_tts_engine(tts_backend)
+    print(f"Using TTS: {tts.label}", flush=True)
 
     if MEMORY_FILE_PATH:
         conversation, memory_notes = load_memory_file(MEMORY_FILE_PATH, SYSTEM_PROMPT)
@@ -669,8 +1442,9 @@ def main() -> None:
     if MEMORY_FILE_PATH:
         print(f"Memory file: {MEMORY_FILE_PATH!r}", flush=True)
     print(f"LLM max_tokens: {LLM_MAX_TOKENS}", flush=True)
+    print(f"LLM reasoning: {OPENROUTER_REASONING_EFFORT!r} (OpenRouter)", flush=True)
     print("Press Ctrl+C to quit.\n", flush=True)
-    speak("Hello! I'm ready. How can I help you?", kokoro)
+    tts.speak("Hello! I'm ready. How can I help you?")
     wait_after_playback()
 
     while True:
@@ -683,19 +1457,18 @@ def main() -> None:
 
             # 2. STT
             print("[Transcribing ...]", flush=True)
-            user_text = transcribe(audio, asr)
+            user_text = stt_transcribe(audio)
             if not user_text:
                 print("[No speech detected, listening again]", flush=True)
                 continue
             print(f"[You]: {user_text}", flush=True)
 
             if user_wants_memory_cleared(user_text):
-                memory_notes = ""
-                conversation = [build_system_message(SYSTEM_PROMPT, "")]
-                if MEMORY_FILE_PATH:
-                    save_memory_file(MEMORY_FILE_PATH, memory_notes, conversation)
-                print("[Memory]: cleared (in-session + saved file).", flush=True)
-                speak("Okay, I've cleared my memory. We're starting fresh.", kokoro)
+                conversation, memory_notes = wipe_all_agent_memory(
+                    SYSTEM_PROMPT, MEMORY_FILE_PATH
+                )
+                print("[Memory]: fully cleared (conversation, compressed notes, disk).", flush=True)
+                tts.speak("Okay, I've cleared my memory. We're starting fresh.")
                 wait_after_playback()
                 continue
 
@@ -710,7 +1483,7 @@ def main() -> None:
                     max_tokens=LLM_MAX_TOKENS,
                 )
                 sentence_iter  = iter_sentences(token_stream)
-                reply          = speak_chunked(sentence_iter, kokoro)
+                reply          = tts.speak_chunked(sentence_iter)
             except requests.HTTPError as e:
                 print(f"[LLM HTTP error]: {e}", flush=True)
                 pop_pending_user_turn(conversation)
@@ -740,7 +1513,7 @@ def main() -> None:
             print("\n\nGoodbye!", flush=True)
             if MEMORY_FILE_PATH:
                 save_memory_file(MEMORY_FILE_PATH, memory_notes, conversation)
-            speak("Goodbye!", kokoro)
+            tts.speak("Goodbye!")
             break
         except Exception as e:
             print(f"[Unexpected error]: {e}", flush=True)
