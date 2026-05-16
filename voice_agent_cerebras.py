@@ -23,9 +23,7 @@ Optional environment (see .env.example):
   VOICE_LIST_DEVICES=1 — print all input-capable devices at startup
   VOICE_POST_PLAYBACK_SLEEP — seconds to wait after TTS before listening (reduces speaker echo)
   VOICE_MAX_HISTORY_PAIRS, VOICE_MAX_CONTEXT_CHARS, VOICE_MEMORY_NOTES_MAX_CHARS — context window
-  VOICE_MEMORY — 0/off = no history or disk; 1/on = session + optional disk via VOICE_MEMORY_PATH
-  VOICE_MEMORY_PATH — JSON file to persist memory + recent turns across runs
-  Say “memory off” / “memory on” / “clear your memory” to control at runtime
+  VOICE_MEMORY_PATH — JSON file to persist memory + recent turns across runs (empty = off)
   VOICE_LLM_MAX_TOKENS — completion cap for spoken replies
   VOICE_LLM_BACKEND — openrouter | cerebras (also --llm)
   CEREBRAS_API_KEY, CEREBRAS_MODEL, CEREBRAS_BASE_URL — Cerebras Inference (see cerebras.ai)
@@ -36,11 +34,9 @@ Optional environment (see .env.example):
   WHISPER_MODEL, WHISPER_DEVICE, WHISPER_COMPUTE_TYPE — faster-whisper options
   VOICE_TTS_BACKEND — kokoro | openai | openvox (also --tts)
   OPENVox_* — local voice API at http://127.0.0.1:8000/v1 (see OPENVox_BASE_URL)
-  VOICE_VISION — webcam; hybrid LLM (Cerebras text / OpenRouter vision when frame attached)
 """
 
 import base64
-import copy
 import io
 import json
 import os
@@ -72,8 +68,6 @@ from typing import Iterator, Optional, List, Dict, Tuple, Callable, Any, Union, 
 SampleRateSpec = Union[int, Callable[[], int]]
 import requests
 
-import voice_vision
-
 if TYPE_CHECKING:
     from kokoro import KPipeline
 
@@ -89,99 +83,11 @@ CEREBRAS_MODEL      = os.environ.get("CEREBRAS_MODEL", "llama3.1-8b").strip()
 # gpt-oss / glm stream thinking in delta.reasoning unless reasoning_format=hidden (voice default)
 CEREBRAS_REASONING_FORMAT = os.environ.get("CEREBRAS_REASONING_FORMAT", "hidden").strip().lower()
 CEREBRAS_REASONING_EFFORT = os.environ.get("CEREBRAS_REASONING_EFFORT", "low").strip().lower()
-OPENROUTER_VISION_MODEL = os.environ.get(
-    "OPENROUTER_VISION_MODEL", "google/gemini-2.0-flash-001"
-).strip()
-OPENROUTER_VISION_MODEL_FALLBACK = os.environ.get(
-    "OPENROUTER_VISION_MODEL_FALLBACK", "google/gemini-2.0-flash-001"
-).strip()
-# Auto-attach camera only on every_turn when utterance has at least this many words
-VISION_MIN_WORDS_FOR_AUTO = max(1, int(os.environ.get("VISION_MIN_WORDS_FOR_AUTO", "3")))
-# After a vision turn, attach camera on "tell me more", "keep looking", etc.
-VISION_FOLLOWUP = os.environ.get("VISION_FOLLOWUP", "1").strip().lower() in (
-    "1", "true", "yes", "y", "on",
+SYSTEM_PROMPT       = os.environ.get("SYSTEM_PROMPT",
+    "You are Jullie, my AI assistant. "
+    "Keep responses concise and conversational — 1-3 sentences unless more detail is asked for. "
+    "Avoid emojis, markdown, bullet points, or special characters since your output will be spoken aloud."
 )
-# How many recent user turns keep camera JPEGs in context (API + session memory).
-VISION_MEMORY_FRAMES = max(0, int(os.environ.get("VISION_MEMORY_FRAMES", "3")))
-
-
-def _vision_idle_inspect_enabled() -> bool:
-    raw = os.environ.get("VISION_IDLE_INSPECT", "").strip().lower()
-    if raw in ("0", "false", "no", "off", "n"):
-        return False
-    if raw in ("1", "true", "yes", "on", "y"):
-        return True
-    return VOICE_VISION
-
-
-VISION_IDLE_INSPECT = _vision_idle_inspect_enabled()
-VISION_IDLE_COOLDOWN_SEC = max(
-    5.0, float(os.environ.get("VISION_IDLE_COOLDOWN_SEC", "45")),
-)
-VISION_IDLE_INSPECT_MAX_TOKENS = max(
-    40, int(os.environ.get("VISION_IDLE_INSPECT_MAX_TOKENS", "120")),
-)
-VISION_IDLE_INSPECT_SPEAK = os.environ.get(
-    "VISION_IDLE_INSPECT_SPEAK", "0",
-).strip().lower() in ("1", "true", "yes", "on", "y")
-VISION_IDLE_INSPECT_PROMPT = os.environ.get(
-    "VISION_IDLE_INSPECT_PROMPT",
-    "No speech was detected. Briefly note what is visible in this camera frame: "
-    "who or what is present, what they appear to be doing, and anything that might "
-    "explain why it is quiet. Two short factual sentences maximum.",
-).strip()
-VISION_IDLE_INSPECT_HINT = os.environ.get(
-    "VISION_IDLE_INSPECT_HINT",
-    "Ambient scene check only (user did not speak). Factual notes for later context; "
-    "no greeting, no questions, no markdown.",
-).strip()
-AMBIENT_SCENE_MAX_CHARS = max(
-    200, int(os.environ.get("AMBIENT_SCENE_MAX_CHARS", "2000")),
-)
-AMBIENT_SCENE_HEADER = "Recent scene (camera while listening):"
-# Webcam vision (hybrid LLM: Cerebras text-only, OpenRouter when a frame is attached)
-VOICE_VISION = os.environ.get("VOICE_VISION", "0").strip().lower() in (
-    "1", "true", "yes", "y", "on",
-)
-VISION_MODE = os.environ.get("VISION_MODE", "both").strip().lower()  # every_turn | phrase | both
-VISION_ATTACH = os.environ.get("VISION_ATTACH", "every_turn").strip().lower()
-VISION_SYSTEM_HINT = os.environ.get(
-    "VISION_SYSTEM_HINT",
-    "One or more camera frames from this conversation are attached (newest user message "
-    "is the latest view). Describe only what is clearly visible and answer their question. "
-    "Use 1-3 short sentences for speech; plain words only (no markdown, lists, or emoji). "
-    "If unsure, say so—do not invent people, objects, or scenery outside the frames.",
-).strip()
-VISION_MEMORY_HINT = os.environ.get(
-    "VISION_MEMORY_HINT",
-    "No new frame this turn—use the attached frames from earlier in this session. "
-    "Prefer the most recent user frame for what is happening now.",
-).strip()
-VISION_NO_CAMERA_HINT = os.environ.get(
-    "VISION_NO_CAMERA_HINT",
-    "They asked you to look, but there is NO camera image this turn. Do not describe "
-    "sights or continue visual details from earlier turns. In one sentence, say the "
-    "camera is unavailable right now; then help only from what they said in words.",
-).strip()
-VISION_TEXT_ONLY_HINT = os.environ.get(
-    "VISION_TEXT_ONLY_HINT",
-    "No camera image this turn. Do not describe how anyone looks, their room, a screen, "
-    "or any scene. Do not roleplay that you are with them in person. Reply from their "
-    "words only.",
-).strip()
-SYSTEM_PROMPT = os.environ.get(
-    "SYSTEM_PROMPT",
-    "You are Jullie, a voice assistant in a live spoken conversation with me. "
-    "Every reply is read aloud: use 1-3 short, natural sentences unless I ask for more detail. "
-    "Plain spoken English only—no emojis, markdown, bullet points, URLs, or stage directions. "
-    "You may describe what you see only when my message includes a live camera image this turn; "
-    "without an image, never claim you see me, my room, or on-screen content, and do not "
-    "reuse or embellish visual details from earlier turns. "
-    "If I ask what you see but no image is attached, say the camera is not active and invite "
-    "me to ask again (e.g. 'what do you see'). "
-    "Stay helpful and factual from my words; do not invent intimate scenes or pretend we share "
-    "a physical space unless I clearly invite that in speech.",
-).strip()
 
 # Audio capture (override with VOICE_* env vars — defaults tuned for quieter mics / shorter utterances)
 SAMPLE_RATE         = 16000   # Qwen3-ASR expects 16 kHz
@@ -288,29 +194,7 @@ MAX_CONTEXT_CHARS       = int(os.environ.get("VOICE_MAX_CONTEXT_CHARS", "10000")
 MAX_MEMORY_NOTES_CHARS  = int(os.environ.get("VOICE_MEMORY_NOTES_MAX_CHARS", "4000"))
 # Total chars sent to OpenRouter (system + turns); 0 = no cap beyond pair/notes limits
 MAX_PROMPT_CHARS        = int(os.environ.get("VOICE_MAX_PROMPT_CHARS", "5000"))
-MEMORY_FILE_PATH_RAW    = os.environ.get("VOICE_MEMORY_PATH", "").strip()
-
-
-def _env_flag_on(raw: str) -> bool:
-    return raw.strip().lower() in ("1", "true", "yes", "y", "on", "enable", "enabled")
-
-
-def _env_flag_off(raw: str) -> bool:
-    return raw.strip().lower() in ("0", "false", "no", "n", "off", "disable", "disabled")
-
-
-def _default_memory_enabled() -> bool:
-    raw = os.environ.get("VOICE_MEMORY", "").strip()
-    if _env_flag_off(raw):
-        return False
-    if _env_flag_on(raw):
-        return True
-    return bool(MEMORY_FILE_PATH_RAW)
-
-
-MEMORY_ENABLED_DEFAULT = _default_memory_enabled()
-_session_memory_enabled: Optional[bool] = None
-
+MEMORY_FILE_PATH        = os.environ.get("VOICE_MEMORY_PATH", "").strip()
 LLM_MAX_TOKENS          = max(64, int(os.environ.get("VOICE_LLM_MAX_TOKENS", "512")))
 MEMORY_FILE_VERSION     = 1
 # ───────────────────────────────────────────────────────────────────────────────
@@ -600,38 +484,6 @@ class LLMProviderConfig:
         return f"{self.provider} ({self.model})"
 
 
-def _parse_memory_argv() -> Optional[bool]:
-    """--no-memory / --memory-off → False; --memory / --memory-on → True."""
-    args = sys.argv[1:]
-    for a in args:
-        if a in ("--no-memory", "--memory-off", "--no-mem"):
-            return False
-        if a in ("--memory", "--memory-on", "--mem"):
-            return True
-    return None
-
-
-def memory_active() -> bool:
-    """Session memory (history + optional disk). Runtime override via voice commands."""
-    if _session_memory_enabled is not None:
-        return _session_memory_enabled
-    cli = _parse_memory_argv()
-    if cli is not None:
-        return cli
-    return MEMORY_ENABLED_DEFAULT
-
-
-def effective_memory_path() -> str:
-    if not memory_active():
-        return ""
-    return MEMORY_FILE_PATH_RAW
-
-
-def fresh_conversation(base_system_prompt: str = SYSTEM_PROMPT) -> Tuple[List[Dict], str]:
-    """System-only state (no turn history, no compressed notes)."""
-    return [build_system_message(base_system_prompt, "")], ""
-
-
 def _parse_llm_argv() -> Optional[str]:
     args = sys.argv[1:]
     for i, a in enumerate(args):
@@ -710,288 +562,6 @@ def resolve_llm_config() -> LLMProviderConfig:
     )
 
 
-_vision_llm_configs: Dict[str, LLMProviderConfig] = {}
-
-
-def _make_openrouter_vision_config(model: str, title_suffix: str = "") -> LLMProviderConfig:
-    title = "Voice Agent Vision" + (f" {title_suffix}" if title_suffix else "")
-    return LLMProviderConfig(
-        provider="openrouter",
-        api_key=OPENROUTER_API_KEY,
-        model=model,
-        chat_url="https://openrouter.ai/api/v1/chat/completions",
-        extra_headers={
-            "HTTP-Referer": "https://voice-agent.local",
-            "X-Title": title,
-        },
-    )
-
-
-def effective_openrouter_vision_model() -> str:
-    """
-    Pick a vision model that streams speakable delta.content.
-    Reasoning models (e.g. nemotron-*-reasoning) often return empty content for voice.
-    """
-    primary = (OPENROUTER_VISION_MODEL or "google/gemini-2.0-flash-001").strip()
-    fallback = (OPENROUTER_VISION_MODEL_FALLBACK or "").strip()
-    if (
-        fallback
-        and fallback != primary
-        and _model_streams_reasoning_separately(primary)
-    ):
-        return fallback
-    return primary
-
-
-def resolve_vision_llm_config(model: Optional[str] = None) -> LLMProviderConfig:
-    """OpenRouter vision model for turns that include a camera frame."""
-    if not OPENROUTER_API_KEY:
-        sys.exit(
-            "Error: OPENROUTER_API_KEY is required for vision turns.\n"
-            "  export OPENROUTER_API_KEY='sk-or-...'"
-        )
-    model_id = (model or effective_openrouter_vision_model()).strip()
-    if model_id not in _vision_llm_configs:
-        _vision_llm_configs[model_id] = _make_openrouter_vision_config(model_id)
-    return _vision_llm_configs[model_id]
-
-
-def resolve_vision_fallback_llm_config() -> Optional[LLMProviderConfig]:
-    """Second vision model when the active one returns an empty stream."""
-    active = effective_openrouter_vision_model()
-    fallback = (OPENROUTER_VISION_MODEL_FALLBACK or "google/gemini-2.0-flash-001").strip()
-    configured = (OPENROUTER_VISION_MODEL or "").strip()
-    if not fallback or fallback == active:
-        return None
-    if configured and configured != active:
-        return resolve_vision_llm_config(configured)
-    return resolve_vision_llm_config(fallback)
-
-
-def pick_llm_for_turn(has_image: bool, default: LLMProviderConfig) -> LLMProviderConfig:
-    if has_image:
-        return resolve_vision_llm_config()
-    return default
-
-
-def stream_llm_vision_with_fallback(
-    messages: List[Dict],
-    primary: LLMProviderConfig,
-    *,
-    max_tokens: int = LLM_MAX_TOKENS,
-) -> Iterator[str]:
-    """Stream vision LLM; on empty content retry OPENROUTER_VISION_MODEL_FALLBACK once."""
-    fallback = resolve_vision_fallback_llm_config()
-    models: List[LLMProviderConfig] = [primary]
-    if fallback is not None:
-        models.append(fallback)
-    last_err: Optional[Exception] = None
-    for i, llm in enumerate(models):
-        try:
-            yield from stream_llm(
-                messages, llm, max_tokens=max_tokens, vision_turn=True,
-            )
-            return
-        except RuntimeError as exc:
-            last_err = exc
-            if "no speakable content" not in str(exc) or i + 1 >= len(models):
-                raise
-            print(
-                f"[Vision]: {primary.model!r} returned no speakable text; "
-                f"retrying with {models[i + 1].model!r} ...",
-                flush=True,
-            )
-    if last_err is not None:
-        raise last_err
-    raise RuntimeError("LLM returned no speakable content")
-
-
-def extract_message_text(content: Any) -> str:
-    """Plain text from a message content field (string or multimodal list)."""
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts: List[str] = []
-        for part in content:
-            if isinstance(part, dict) and part.get("type") == "text":
-                t = part.get("text")
-                if t:
-                    parts.append(str(t))
-        return " ".join(parts).strip()
-    return str(content or "").strip()
-
-
-def message_has_image(message: Dict) -> bool:
-    content = message.get("content")
-    if not isinstance(content, list):
-        return False
-    return any(
-        isinstance(part, dict) and part.get("type") == "image_url"
-        for part in content
-    )
-
-
-def messages_have_images(messages: List[Dict]) -> bool:
-    return any(message_has_image(m) for m in messages)
-
-
-def message_to_text_only(message: Dict) -> Dict:
-    """Copy a chat message with text-only content (no image_url parts)."""
-    return {
-        "role": message.get("role"),
-        "content": extract_message_text(message.get("content")),
-    }
-
-
-def copy_message_for_api(message: Dict) -> Dict:
-    """Shallow copy; deep-copy multimodal content lists so history is not mutated."""
-    role = message.get("role")
-    content = message.get("content")
-    if isinstance(content, list):
-        return {"role": role, "content": copy.deepcopy(content)}
-    return {"role": role, "content": content}
-
-
-def build_user_message(text: str, image_b64: Optional[str] = None) -> Dict:
-    if image_b64:
-        return {
-            "role": "user",
-            "content": [
-                {"type": "text", "text": text},
-                {
-                    "type": "image_url",
-                    "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"},
-                },
-            ],
-        }
-    return {"role": "user", "content": text}
-
-
-def _append_system_hint(msgs: List[Dict], hint: str) -> None:
-    if not hint.strip() or not msgs or msgs[0].get("role") != "system":
-        return
-    base = extract_message_text(msgs[0].get("content"))
-    msgs[0] = {"role": "system", "content": f"{base.rstrip()}\n\n{hint.strip()}"}
-
-
-# Recent camera frames when VOICE_MEMORY=0 (verbal memory off, vision context on).
-_vision_frame_history: List[Dict] = []
-_ambient_scene_notes: str = ""
-_last_idle_inspect_mono: float = 0.0
-
-
-def clear_vision_frame_history() -> None:
-    _vision_frame_history.clear()
-
-
-def clear_ambient_scene_notes() -> None:
-    global _ambient_scene_notes
-    _ambient_scene_notes = ""
-
-
-def append_ambient_scene_note(observation: str) -> None:
-    global _ambient_scene_notes
-    text = observation.strip()
-    if not text:
-        return
-    stamp = time.strftime("%H:%M")
-    line = f"[{stamp}] {text}"
-    if _ambient_scene_notes.strip():
-        _ambient_scene_notes = f"{_ambient_scene_notes.rstrip()}\n{line}"
-    else:
-        _ambient_scene_notes = line
-    if len(_ambient_scene_notes) > AMBIENT_SCENE_MAX_CHARS:
-        _ambient_scene_notes = _ambient_scene_notes[-AMBIENT_SCENE_MAX_CHARS:].lstrip()
-
-
-def _inject_ambient_scene_into_system(msgs: List[Dict]) -> None:
-    scene = _ambient_scene_notes.strip()
-    if not scene or not msgs or msgs[0].get("role") != "system":
-        return
-    base = extract_message_text(msgs[0].get("content"))
-    block = f"{AMBIENT_SCENE_HEADER}\n{scene}"
-    if AMBIENT_SCENE_HEADER in base:
-        idx = base.find(AMBIENT_SCENE_HEADER)
-        base = base[:idx].rstrip()
-    msgs[0] = {
-        "role": "system",
-        "content": f"{base}\n\n{block}" if base else block,
-    }
-
-
-def record_status_is_silence_timeout(status: str) -> bool:
-    return "No input above threshold" in status
-
-
-def drain_llm_stream(token_source: Iterator[str]) -> str:
-    return "".join(token_source).strip()
-
-
-def append_vision_frame_history(user_text: str, image_b64: str) -> None:
-    if VISION_MEMORY_FRAMES <= 0 or not image_b64:
-        return
-    _vision_frame_history.append(build_user_message(user_text, image_b64))
-    del _vision_frame_history[:-VISION_MEMORY_FRAMES]
-
-
-def _retain_recent_frame_messages(msgs: List[Dict]) -> None:
-    """Strip image_url from older user turns; keep the last VISION_MEMORY_FRAMES with images."""
-    if VISION_MEMORY_FRAMES <= 0:
-        for i, m in enumerate(msgs):
-            if message_has_image(m):
-                msgs[i] = message_to_text_only(m)
-        return
-    image_idxs = [
-        i for i, m in enumerate(msgs)
-        if m.get("role") == "user" and message_has_image(m)
-    ]
-    keep = set(image_idxs[-VISION_MEMORY_FRAMES:])
-    for i in image_idxs:
-        if i not in keep:
-            msgs[i] = message_to_text_only(msgs[i])
-
-
-def messages_for_llm_request(
-    conversation: List[Dict],
-    image_b64: Optional[str],
-    *,
-    no_camera_vision: bool = False,
-    extra_vision_turns: Optional[List[Dict]] = None,
-) -> List[Dict]:
-    """API payload: recent user turns may include stored camera frames."""
-    msgs = [copy_message_for_api(m) for m in conversation]
-    if extra_vision_turns:
-        hist = [copy_message_for_api(m) for m in extra_vision_turns]
-        if msgs and msgs[-1].get("role") == "user":
-            msgs = msgs[:-1] + hist + [msgs[-1]]
-        else:
-            msgs.extend(hist)
-    _retain_recent_frame_messages(msgs)
-    if image_b64 and msgs and msgs[-1].get("role") == "user":
-        user_text = extract_message_text(msgs[-1].get("content"))
-        msgs[-1] = build_user_message(user_text, image_b64)
-    has_images = messages_have_images(msgs)
-    if has_images:
-        _append_system_hint(msgs, VISION_SYSTEM_HINT)
-        if not image_b64 and VISION_MEMORY_HINT.strip():
-            _append_system_hint(msgs, VISION_MEMORY_HINT)
-    elif no_camera_vision:
-        _append_system_hint(msgs, VISION_NO_CAMERA_HINT)
-    elif VOICE_VISION:
-        _append_system_hint(msgs, VISION_TEXT_ONLY_HINT)
-    _inject_ambient_scene_into_system(msgs)
-    return msgs
-
-
-def _model_streams_reasoning_separately(model: str) -> bool:
-    """Models that may put tokens in delta.reasoning instead of delta.content."""
-    m = model.lower()
-    return any(
-        tag in m
-        for tag in ("reasoning", "thinking", "r1", "deepseek-r", "qwq", "nemotron")
-    )
-
-
 def _openrouter_reasoning_body() -> Optional[Dict[str, Any]]:
     """
     Build OpenRouter `reasoning` object when the model supports it.
@@ -1010,16 +580,6 @@ def _openrouter_reasoning_body() -> Optional[Dict[str, Any]]:
     if raw in ("on", "true", "1", "default", "medium"):
         return {"enabled": True}
     return {"effort": raw}
-
-
-def _openrouter_reasoning_for_request(model: str, *, vision_turn: bool) -> Optional[Dict[str, Any]]:
-    """
-    Vision / reasoning models must exclude thinking tokens so TTS gets delta.content.
-    See https://openrouter.ai/docs/guides/best-practices/reasoning-tokens
-    """
-    if vision_turn or _model_streams_reasoning_separately(model):
-        return {"exclude": True}
-    return _openrouter_reasoning_body()
 
 
 def _llm_api_error_detail(resp: requests.Response) -> str:
@@ -1092,7 +652,6 @@ def stream_llm(
     llm: LLMProviderConfig,
     *,
     max_tokens: int = LLM_MAX_TOKENS,
-    vision_turn: bool = False,
 ) -> Iterator[str]:
     """Yield text tokens from a streaming chat completion (OpenRouter or Cerebras).
 
@@ -1119,7 +678,7 @@ def stream_llm(
             }
             reasoning: Optional[Dict[str, Any]] = None
             if provider == "openrouter":
-                reasoning = _openrouter_reasoning_for_request(model, vision_turn=vision_turn)
+                reasoning = _openrouter_reasoning_body()
                 if reasoning is not None:
                     body["reasoning"] = reasoning
             elif provider == "cerebras":
@@ -1167,7 +726,6 @@ def stream_llm(
                         flush=True,
                     )
             resp.raise_for_status()
-            trailing_message = ""
             for line in resp.iter_lines():
                 if not line:
                     continue
@@ -1177,33 +735,19 @@ def stream_llm(
                         break
                     try:
                         obj = json.loads(data)
-                        choice = obj["choices"][0]
-                        delta_obj = choice.get("delta") or {}
+                        delta_obj = obj["choices"][0].get("delta") or {}
                         delta = _stream_delta_speakable_text(delta_obj)
                         if delta:
                             got_speakable = True
                             token_q.put(delta)
-                        msg = choice.get("message") or {}
-                        if isinstance(msg, dict):
-                            mc = msg.get("content")
-                            if isinstance(mc, str) and mc.strip():
-                                trailing_message = mc
                     except (json.JSONDecodeError, KeyError, IndexError):
                         continue
-            if not got_speakable and trailing_message.strip():
-                got_speakable = True
-                token_q.put(trailing_message)
             if not got_speakable:
                 hint = ""
                 if provider == "cerebras" and "gpt-oss" in model.lower():
                     hint = (
                         " (gpt-oss streams thinking in delta.reasoning by default; "
                         "use CEREBRAS_REASONING_FORMAT=hidden or CEREBRAS_MODEL=llama3.1-8b)"
-                    )
-                elif provider == "openrouter" and _model_streams_reasoning_separately(model):
-                    hint = (
-                        " (reasoning model returned no delta.content; "
-                        "try OPENROUTER_VISION_MODEL=google/gemini-2.0-flash-001 or a non-reasoning vision model)"
                     )
                 token_q.put(
                     RuntimeError(f"LLM returned no speakable content{hint}")
@@ -1885,12 +1429,12 @@ MEMORY_HEADER = "Earlier in this session (compressed):"
 
 
 def _rest_message_chars(rest: List[Dict]) -> int:
-    return sum(len(extract_message_text(m.get("content"))) for m in rest)
+    return sum(len(str(m.get("content", ""))) for m in rest)
 
 
 def llm_context_char_count(messages: List[Dict]) -> int:
-    """Total text characters in messages (images excluded)."""
-    return sum(len(extract_message_text(m.get("content"))) for m in messages)
+    """Total characters sent to OpenRouter (system + all turns)."""
+    return sum(len(str(m.get("content", ""))) for m in messages)
 
 
 def conversation_needs_trim(conversation: List[Dict]) -> bool:
@@ -2056,9 +1600,9 @@ def load_memory_file(path: str, base_system_prompt: str) -> Tuple[List[Dict], st
         role = m.get("role")
         if role not in ("user", "assistant"):
             continue
-        content = extract_message_text(m.get("content"))
-        if not content:
-            continue
+        content = m.get("content")
+        if not isinstance(content, str):
+            content = str(content)
         cleaned.append({"role": role, "content": content})
 
     # Drop orphan last message so we only have complete pairs for history
@@ -2078,12 +1622,8 @@ _memory_save_lock = threading.Lock()
 
 
 def save_memory_file(path: str, memory_notes: str, conversation: List[Dict]) -> None:
-    """Persist memory notes and turns (text only on disk; frames stay in-session)."""
-    turns = [
-        message_to_text_only(m)
-        for m in conversation
-        if m.get("role") in ("user", "assistant")
-    ]
+    """Persist memory notes and non-system turns."""
+    turns = [m for m in conversation if m.get("role") in ("user", "assistant")]
     payload = {
         "version": MEMORY_FILE_VERSION,
         "memory_notes": memory_notes.strip(),
@@ -2187,36 +1727,6 @@ _QUICK_MEMORY_CLEAR_RE = re.compile(
 )
 
 
-_MEMORY_OFF_RE = re.compile(
-    r"\b(?:memory off|disable memory|turn memory off|stop remembering|"
-    r"don'?t remember|no memory)\b",
-    re.IGNORECASE,
-)
-
-_MEMORY_ON_RE = re.compile(
-    r"\b(?:memory on|enable memory|turn memory on|start remembering|"
-    r"remember (?:again|everything))\b",
-    re.IGNORECASE,
-)
-
-
-def user_wants_memory_disabled(text: str) -> bool:
-    if not (text and str(text).strip()):
-        return False
-    return bool(_MEMORY_OFF_RE.search(str(text).strip()))
-
-
-def user_wants_memory_enabled(text: str) -> bool:
-    if not (text and str(text).strip()):
-        return False
-    return bool(_MEMORY_ON_RE.search(str(text).strip()))
-
-
-def set_session_memory_enabled(enabled: bool) -> None:
-    global _session_memory_enabled
-    _session_memory_enabled = enabled
-
-
 def user_wants_memory_cleared(text: str) -> bool:
     """True if the user asked to clear session / persisted memory (voice command)."""
     if not (text and str(text).strip()):
@@ -2234,158 +1744,11 @@ def user_wants_memory_cleared(text: str) -> bool:
     return bool(_MEMORY_CLEAR_RE.search(t))
 
 
-_VISION_PHRASE_RE = re.compile(
-    r"\b(?:"
-    r"what do you see|what can you see|what else can you see|tell me what you see|"
-    r"describe what you see|can you see|see through|through (?:your eyes|the camera)|"
-    r"(?:use |via )?the camera|look at (?:this|me|that|it)|have a look|take a look|"
-    r"look around|keep looking|carry on looking|continue (?:looking|to look|telling(?: me)?)|"
-    r"tell me (?:all|more|everything)|do you see|what(?:'s| is) on (?:the )?screen|"
-    r"what am i (?:doing|holding)|look and see|have a look and see"
-    r")\b",
-    re.IGNORECASE,
-)
-
-_VISION_FOLLOWUP_RE = re.compile(
-    r"\b(?:"
-    r"tell me (?:more|all|everything)|what else|anything else|go on|carry on|"
-    r"continue(?:\s+looking|\s+telling(?:\s+me)?)?|keep looking|look again|describe more|"
-    r"have a look|what you can see|through (?:your eyes|the camera)|"
-    r"more about (?:that|it|this)|keep going|and what else"
-    r")\b",
-    re.IGNORECASE,
-)
-
-
-def _vision_phrase_list() -> Tuple[str, ...]:
-    return tuple(
-        _normalize_voice_command_text(p)
-        for p in (
-            "What do you see?",
-            "What can you see?",
-            "Can you see me?",
-            "Can you see this?",
-            "Look at this.",
-            "Look at me.",
-            "Take a look.",
-            "Do you see that?",
-            "What's on screen?",
-            "What am I doing?",
-            "What am I holding?",
-            "Continue telling me what you can see.",
-            "Have a look and see.",
-            "See through your eyes.",
-            "Tell me all.",
-        )
-    )
-
-
-def user_wants_vision_followup(text: str) -> bool:
-    """Follow-up after a vision turn (e.g. 'tell me more', 'keep looking')."""
-    if not VISION_FOLLOWUP or not (text and str(text).strip()):
-        return False
-    raw = str(text).strip()
-    if _VISION_FOLLOWUP_RE.search(raw):
-        return True
-    return bool(_VISION_FOLLOWUP_RE.search(_normalize_voice_command_text(raw)))
-
-
-def user_wants_vision(text: str) -> bool:
-    if not (text and str(text).strip()):
-        return False
-    raw = str(text).strip()
-    if _VISION_PHRASE_RE.search(raw):
-        return True
-    t = _normalize_voice_command_text(raw)
-    if _VISION_PHRASE_RE.search(t):
-        return True
-    return any(p and p in t for p in _vision_phrase_list())
-
-
-def _utterance_warrants_auto_vision(user_text: str) -> bool:
-    """Skip camera on noise like 'Yeah.' / 'A.' when attach=every_turn."""
-    words = [w for w in str(user_text).strip().split() if w.strip()]
-    return len(words) >= VISION_MIN_WORDS_FOR_AUTO
-
-
-def should_attach_vision(user_text: str, *, last_turn_had_vision: bool = False) -> bool:
-    if not VOICE_VISION:
-        return False
-    if user_wants_vision(user_text):
-        return True
-    if last_turn_had_vision and user_wants_vision_followup(user_text):
-        return True
-    if VISION_MODE == "phrase":
-        return False
-    if VISION_MODE == "every_turn":
-        return _utterance_warrants_auto_vision(user_text)
-    if VISION_ATTACH in ("every_turn", "always", "1", "on", "true", "yes"):
-        return _utterance_warrants_auto_vision(user_text)
-    return False
-
-
-def maybe_idle_scene_inspect(
-    *,
-    record_status: str,
-    vision_active: bool,
-    memory_notes: str,
-    tts: "TTSEngine",
-) -> Tuple[bool, str]:
-    """
-    On silence timeout (no mic input), capture a frame and note what is visible.
-    Updates ambient scene notes for later turns; optional brief TTS.
-    """
-    global _last_idle_inspect_mono
-    if not VISION_IDLE_INSPECT or not record_status_is_silence_timeout(record_status):
-        return vision_active, memory_notes
-    now = time.monotonic()
-    if now - _last_idle_inspect_mono < VISION_IDLE_COOLDOWN_SEC:
-        return vision_active, memory_notes
-    if not vision_active:
-        vision_active = voice_vision.ensure_camera()
-        if not vision_active:
-            return vision_active, memory_notes
-    image_b64 = voice_vision.capture_snapshot()
-    if not image_b64:
-        return vision_active, memory_notes
-    _last_idle_inspect_mono = now
-    print("[Vision]: idle listen — inspecting camera ...", flush=True)
-    turn_llm = resolve_vision_llm_config()
-    user_msg = build_user_message(VISION_IDLE_INSPECT_PROMPT, image_b64)
-    msgs: List[Dict] = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        user_msg,
-    ]
-    _append_system_hint(msgs, VISION_IDLE_INSPECT_HINT)
-    try:
-        observation = drain_llm_stream(
-            stream_llm_vision_with_fallback(
-                msgs,
-                turn_llm,
-                max_tokens=VISION_IDLE_INSPECT_MAX_TOKENS,
-            )
-        )
-    except Exception as exc:
-        print(f"[Vision]: idle inspect failed ({exc})", flush=True)
-        return vision_active, memory_notes
-    if not observation:
-        print("[Vision]: idle inspect returned nothing.", flush=True)
-        return vision_active, memory_notes
-    append_ambient_scene_note(observation)
-    print(f"[Vision]: idle scene — {observation}", flush=True)
-    if VISION_IDLE_INSPECT_SPEAK:
-        tts.speak(observation)
-        wait_after_playback()
-    return vision_active, memory_notes
-
-
 def wipe_all_agent_memory(base_system_prompt: str, memory_path: str) -> Tuple[List[Dict], str]:
     """
     Reset conversation and compressed notes to a clean system-only state.
     When memory_path is set, overwrites the JSON file with empty memory_notes and turns.
     """
-    clear_vision_frame_history()
-    clear_ambient_scene_notes()
     memory_notes = ""
     conversation: List[Dict] = [build_system_message(base_system_prompt, memory_notes)]
     if memory_path.strip():
@@ -2435,31 +1798,20 @@ def main() -> None:
         run_tts_warm_up(tts)
         print("=== Preload complete ===\n", flush=True)
 
-    mem_path = effective_memory_path()
-    if memory_active():
-        if mem_path:
-            conversation, memory_notes = load_memory_file(mem_path, SYSTEM_PROMPT)
-            conversation, memory_notes = trim_history_with_memory(
-                conversation,
-                memory_notes,
-                base_system_prompt=SYSTEM_PROMPT,
-                max_pairs=MAX_HISTORY_PAIRS,
-                max_context_chars=MAX_CONTEXT_CHARS,
-            )
-        else:
-            memory_notes = ""
-            conversation = [build_system_message(SYSTEM_PROMPT, memory_notes)]
+    if MEMORY_FILE_PATH:
+        conversation, memory_notes = load_memory_file(MEMORY_FILE_PATH, SYSTEM_PROMPT)
+        conversation, memory_notes = trim_history_with_memory(
+            conversation,
+            memory_notes,
+            base_system_prompt=SYSTEM_PROMPT,
+            max_pairs=MAX_HISTORY_PAIRS,
+            max_context_chars=MAX_CONTEXT_CHARS,
+        )
     else:
-        conversation, memory_notes = fresh_conversation()
+        memory_notes = ""
+        conversation = [build_system_message(SYSTEM_PROMPT, memory_notes)]
 
     print(f"\n=== Voice Agent Ready === ({llm_config.label()})", flush=True)
-    if memory_active():
-        if mem_path:
-            print(f"Memory: on (session + disk {mem_path!r})", flush=True)
-        else:
-            print("Memory: on (session only; set VOICE_MEMORY_PATH for disk)", flush=True)
-    else:
-        print("Memory: off (each turn is independent; nothing saved)", flush=True)
     if MAX_CONTEXT_CHARS > 0:
         print(
             f"Context: up to {MAX_HISTORY_PAIRS} turn pairs, "
@@ -2481,6 +1833,8 @@ def main() -> None:
             f"[Timing]: loaded prompt {llm_context_char_count(conversation)} chars",
             flush=True,
         )
+    if MEMORY_FILE_PATH:
+        print(f"Memory file: {MEMORY_FILE_PATH!r}", flush=True)
     print(f"LLM max_tokens: {LLM_MAX_TOKENS}", flush=True)
     if llm_config.provider == "openrouter":
         print(f"LLM reasoning: {OPENROUTER_REASONING_EFFORT!r} (OpenRouter)", flush=True)
@@ -2490,67 +1844,9 @@ def main() -> None:
             f"effort={CEREBRAS_REASONING_EFFORT!r}",
             flush=True,
         )
-    vision_enabled = VOICE_VISION
-    vision_active = False
-    if vision_enabled:
-        if voice_vision.start_camera():
-            vision_active = True
-            print(
-                f"[Vision]: camera ready (device {voice_vision.VISION_CAMERA_DEVICE}, "
-                f"mode={VISION_MODE!r}, attach={VISION_ATTACH!r})",
-                flush=True,
-            )
-            vision_model = effective_openrouter_vision_model()
-            print(f"[Vision]: OpenRouter model {vision_model!r}", flush=True)
-            if (
-                OPENROUTER_VISION_MODEL.strip()
-                and vision_model != OPENROUTER_VISION_MODEL.strip()
-            ):
-                print(
-                    f"[Vision]: using stable model instead of {OPENROUTER_VISION_MODEL!r} "
-                    f"(reasoning models often return no speakable text for voice).",
-                    flush=True,
-                )
-            elif _model_streams_reasoning_separately(vision_model):
-                print(
-                    "[Vision]: reasoning model — using OpenRouter reasoning.exclude.",
-                    flush=True,
-                )
-            fb = resolve_vision_fallback_llm_config()
-            if fb is not None and fb.model != vision_model:
-                print(f"[Vision]: retry fallback if empty: {fb.model!r}", flush=True)
-            if VISION_MEMORY_FRAMES > 0:
-                print(
-                    f"[Vision]: keep last {VISION_MEMORY_FRAMES} camera frame(s) in context.",
-                    flush=True,
-                )
-            if VISION_IDLE_INSPECT:
-                print(
-                    f"[Vision]: idle inspect on silence timeout "
-                    f"(cooldown {VISION_IDLE_COOLDOWN_SEC:g}s"
-                    + (", may speak" if VISION_IDLE_INSPECT_SPEAK else ", silent")
-                    + ").",
-                    flush=True,
-                )
-        else:
-            err = voice_vision.camera_error() or "no frames captured"
-            print(
-                f"[Vision]: camera unavailable ({err}). "
-                "Will retry when you ask to see; say what do you see to retry.",
-                flush=True,
-            )
-            if sys.platform == "darwin":
-                print(
-                    "[Vision]: macOS — allow Camera for Terminal/Python in "
-                    "System Settings → Privacy & Security → Camera.",
-                    flush=True,
-                )
-
     print("Press Ctrl+C to quit.\n", flush=True)
     tts.speak("Hello! I'm ready. How can I help you?")
     wait_after_playback()
-
-    last_turn_had_vision = False
 
     while True:
         try:
@@ -2558,13 +1854,6 @@ def main() -> None:
             audio, record_status = record_until_silence()
             if audio is None:
                 print(f"[Listen skipped]: {record_status}", flush=True)
-                if vision_enabled:
-                    vision_active, memory_notes = maybe_idle_scene_inspect(
-                        record_status=record_status,
-                        vision_active=vision_active,
-                        memory_notes=memory_notes,
-                        tts=tts,
-                    )
                 continue
 
             # 2. STT
@@ -2577,36 +1866,9 @@ def main() -> None:
                 continue
             print(f"[You]: {user_text}", flush=True)
 
-            if user_wants_memory_disabled(user_text):
-                set_session_memory_enabled(False)
-                conversation, memory_notes = fresh_conversation()
-                print("[Memory]: off for this session (no history, no disk saves).", flush=True)
-                tts.speak("Okay, memory is off. I won't remember our conversation.")
-                wait_after_playback()
-                continue
-
-            if user_wants_memory_enabled(user_text):
-                set_session_memory_enabled(True)
-                mem_path = effective_memory_path()
-                if mem_path:
-                    conversation, memory_notes = load_memory_file(mem_path, SYSTEM_PROMPT)
-                    conversation, memory_notes = trim_history_with_memory(
-                        conversation,
-                        memory_notes,
-                        base_system_prompt=SYSTEM_PROMPT,
-                        max_pairs=MAX_HISTORY_PAIRS,
-                        max_context_chars=MAX_CONTEXT_CHARS,
-                    )
-                else:
-                    conversation, memory_notes = fresh_conversation()
-                print("[Memory]: on for this session.", flush=True)
-                tts.speak("Okay, memory is on again.")
-                wait_after_playback()
-                continue
-
             if user_wants_memory_cleared(user_text):
                 conversation, memory_notes = wipe_all_agent_memory(
-                    SYSTEM_PROMPT, effective_memory_path()
+                    SYSTEM_PROMPT, MEMORY_FILE_PATH
                 )
                 print("[Memory]: fully cleared (conversation, compressed notes, disk).", flush=True)
                 tts.speak("Okay, I've cleared my memory. We're starting fresh.")
@@ -2614,84 +1876,18 @@ def main() -> None:
                 continue
 
             # 3. Stream LLM → sentence chunks → overlapped synth+play
-            vision_wanted = vision_enabled and should_attach_vision(
-                user_text, last_turn_had_vision=last_turn_had_vision,
-            )
-            image_b64: Optional[str] = None
-            if vision_wanted and not vision_active:
-                print("[Vision]: retrying camera ...", flush=True)
-                vision_active = voice_vision.ensure_camera()
-                if vision_active:
-                    print("[Vision]: camera ready.", flush=True)
-            if vision_wanted and vision_active:
-                image_b64 = voice_vision.capture_snapshot()
-                if not image_b64:
-                    print("[Vision]: no frame yet; retrying capture ...", flush=True)
-                    time.sleep(0.3)
-                    image_b64 = voice_vision.capture_snapshot()
-            no_camera_vision = vision_wanted and not image_b64
-            if no_camera_vision:
-                print(
-                    "[Vision]: no camera image — will not describe sight "
-                    f"(using {llm_config.label()}).",
-                    flush=True,
-                )
-
-            if memory_active():
-                if image_b64:
-                    conversation.append(build_user_message(user_text, image_b64))
-                else:
-                    conversation.append({"role": "user", "content": user_text})
-                conversation, memory_notes = trim_history_with_memory(
-                    conversation,
-                    memory_notes,
-                    base_system_prompt=SYSTEM_PROMPT,
-                    max_pairs=MAX_HISTORY_PAIRS,
-                    max_context_chars=MAX_CONTEXT_CHARS,
-                )
-            else:
-                conversation, memory_notes = fresh_conversation()
-                if image_b64:
-                    conversation.append(build_user_message(user_text, image_b64))
-                else:
-                    conversation.append({"role": "user", "content": user_text})
-            frame_hist = (
-                None
-                if memory_active()
-                else (list(_vision_frame_history) if _vision_frame_history else None)
-            )
-            api_messages = messages_for_llm_request(
+            conversation.append({"role": "user", "content": user_text})
+            conversation, memory_notes = trim_history_with_memory(
                 conversation,
-                image_b64,
-                no_camera_vision=no_camera_vision,
-                extra_vision_turns=frame_hist,
+                memory_notes,
+                base_system_prompt=SYSTEM_PROMPT,
+                max_pairs=MAX_HISTORY_PAIRS,
+                max_context_chars=MAX_CONTEXT_CHARS,
             )
-            use_vision_llm = messages_have_images(api_messages)
-            turn_llm = pick_llm_for_turn(use_vision_llm, llm_config)
-            frame_count = sum(1 for m in api_messages if message_has_image(m))
-            if vision_enabled:
-                if image_b64:
-                    tag = "follow-up" if last_turn_had_vision and user_wants_vision_followup(user_text) else "phrase"
-                    print(
-                        f"[Vision]: new frame ({tag}) → {turn_llm.label()}"
-                        + (f" ({frame_count} in context)" if frame_count > 1 else ""),
-                        flush=True,
-                    )
-                elif use_vision_llm:
-                    print(
-                        f"[Vision]: {frame_count} frame(s) from memory → {turn_llm.label()}",
-                        flush=True,
-                    )
-                elif vision_wanted:
-                    print(f"[Vision]: camera off → {turn_llm.label()}", flush=True)
-                else:
-                    print(f"[Vision]: text-only → {turn_llm.label()}", flush=True)
             if VOICE_TIMING:
                 print(
                     f"[Timing]: STT {stt_ms:.0f}ms | "
-                    f"prompt {llm_context_char_count(conversation)} chars | "
-                    f"vision={'yes' if use_vision_llm else 'no'}"
-                    + (f" frames={frame_count}" if frame_count else ""),
+                    f"prompt {llm_context_char_count(conversation)} chars",
                     flush=True,
                 )
             print("[Thinking ...]", flush=True)
@@ -2699,19 +1895,11 @@ def main() -> None:
             try:
                 def _timed_token_stream() -> Iterator[str]:
                     first = True
-                    token_source = (
-                        stream_llm_vision_with_fallback(
-                            api_messages, turn_llm, max_tokens=LLM_MAX_TOKENS,
-                        )
-                        if use_vision_llm
-                        else stream_llm(
-                            api_messages,
-                            turn_llm,
-                            max_tokens=LLM_MAX_TOKENS,
-                            vision_turn=False,
-                        )
-                    )
-                    for tok in token_source:
+                    for tok in stream_llm(
+                        conversation,
+                        llm_config,
+                        max_tokens=LLM_MAX_TOKENS,
+                    ):
                         if first:
                             if VOICE_TIMING:
                                 print(
@@ -2732,7 +1920,7 @@ def main() -> None:
                 if e.response is not None:
                     print(
                         f"[LLM HTTP error]: {_llm_api_error_detail(e.response)} "
-                        f"({turn_llm.label()})",
+                        f"({llm_config.label()})",
                         flush=True,
                     )
                 else:
@@ -2748,24 +1936,17 @@ def main() -> None:
                 pop_pending_user_turn(conversation)
                 continue
 
-            last_turn_had_vision = use_vision_llm
-            if image_b64 and not memory_active():
-                append_vision_frame_history(user_text, image_b64)
-            if memory_active():
-                conversation.append({"role": "assistant", "content": reply})
-                if conversation_needs_trim(conversation):
-                    conversation, memory_notes = trim_history_with_memory(
-                        conversation,
-                        memory_notes,
-                        base_system_prompt=SYSTEM_PROMPT,
-                        max_pairs=MAX_HISTORY_PAIRS,
-                        max_context_chars=MAX_CONTEXT_CHARS,
-                    )
-                mem_path = effective_memory_path()
-                if mem_path:
-                    schedule_save_memory_file(mem_path, memory_notes, conversation)
-            else:
-                conversation, memory_notes = fresh_conversation()
+            conversation.append({"role": "assistant", "content": reply})
+            if conversation_needs_trim(conversation):
+                conversation, memory_notes = trim_history_with_memory(
+                    conversation,
+                    memory_notes,
+                    base_system_prompt=SYSTEM_PROMPT,
+                    max_pairs=MAX_HISTORY_PAIRS,
+                    max_context_chars=MAX_CONTEXT_CHARS,
+                )
+            if MEMORY_FILE_PATH:
+                schedule_save_memory_file(MEMORY_FILE_PATH, memory_notes, conversation)
             if VOICE_TIMING:
                 print(
                     f"[Timing]: turn total {(time.perf_counter() - t_stt) * 1000:.0f}ms",
@@ -2775,14 +1956,9 @@ def main() -> None:
 
         except KeyboardInterrupt:
             print("\n\nGoodbye!", flush=True)
-            mem_path = effective_memory_path()
-            if mem_path:
-                save_memory_file(mem_path, memory_notes, conversation)
-            if vision_enabled:
-                voice_vision.stop_camera()
+            if MEMORY_FILE_PATH:
+                save_memory_file(MEMORY_FILE_PATH, memory_notes, conversation)
             llm_config.session.close()
-            for _vc in _vision_llm_configs.values():
-                _vc.session.close()
             tts.speak("Goodbye!")
             break
         except Exception as e:
