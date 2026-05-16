@@ -124,6 +124,27 @@ VISION_IDLE_INSPECT_MAX_TOKENS = max(
 VISION_IDLE_INSPECT_SPEAK = os.environ.get(
     "VISION_IDLE_INSPECT_SPEAK", "0",
 ).strip().lower() in ("1", "true", "yes", "on", "y")
+
+
+def _vision_idle_discussion_enabled() -> bool:
+    raw = os.environ.get("VISION_IDLE_PROMPT_DISCUSSION", "").strip().lower()
+    if raw in ("0", "false", "no", "off", "n"):
+        return False
+    if raw in ("1", "true", "yes", "on", "y"):
+        return True
+    return VISION_IDLE_INSPECT
+
+
+VISION_IDLE_PROMPT_DISCUSSION = _vision_idle_discussion_enabled()
+VISION_IDLE_FRESH_CONVERSATION = os.environ.get(
+    "VISION_IDLE_FRESH_CONVERSATION", "0",
+).strip().lower() in ("1", "true", "yes", "on", "y")
+VISION_IDLE_MIN_QUIET_AFTER_SPEECH_SEC = max(
+    0.0, float(os.environ.get("VISION_IDLE_MIN_QUIET_AFTER_SPEECH_SEC", "90")),
+)
+VISION_IDLE_DISCUSSION_MAX_TOKENS = max(
+    40, int(os.environ.get("VISION_IDLE_DISCUSSION_MAX_TOKENS", "180")),
+)
 VISION_IDLE_INSPECT_PROMPT = os.environ.get(
     "VISION_IDLE_INSPECT_PROMPT",
     "No speech was detected. Briefly note what is visible in this camera frame: "
@@ -134,6 +155,49 @@ VISION_IDLE_INSPECT_HINT = os.environ.get(
     "VISION_IDLE_INSPECT_HINT",
     "Ambient scene check only (user did not speak). Factual notes for later context; "
     "no greeting, no questions, no markdown.",
+).strip()
+VISION_IDLE_DISCUSSION_PROMPT = os.environ.get(
+    "VISION_IDLE_DISCUSSION_PROMPT",
+    "I have been quiet. Internal scene notes (do not repeat verbatim):\n{observation}\n\n"
+    "Say ONE friendly spoken opener: a brief new angle on the scene, then ONE question "
+    "that invites me to talk. Two short sentences. Do not copy the notes word-for-word.",
+).strip()
+VISION_IDLE_DISCUSSION_HINT = os.environ.get(
+    "VISION_IDLE_DISCUSSION_HINT",
+    "Initiate conversation after idle silence. Professional and curious—not intimate "
+    "(no pet names like honey or dear). Do not repeat the internal notes verbatim. "
+    "Plain speech for TTS; no markdown.",
+).strip()
+VISION_IDLE_OPENER_FALLBACK = os.environ.get(
+    "VISION_IDLE_OPENER_FALLBACK",
+    "It has been quiet for a bit — what is on your mind?",
+).strip()
+
+
+def _vision_idle_combined_enabled() -> bool:
+    raw = os.environ.get("VISION_IDLE_COMBINED", "").strip().lower()
+    if raw in ("0", "false", "no", "off"):
+        return False
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    return VISION_IDLE_PROMPT_DISCUSSION
+
+
+VISION_IDLE_COMBINED = _vision_idle_combined_enabled()
+VISION_IDLE_COMBINED_PROMPT = os.environ.get(
+    "VISION_IDLE_COMBINED_PROMPT",
+    "No speech was detected. Look at the camera frame and reply using exactly this format:\n"
+    "NOTE: <two short factual sentences about what you see>\n"
+    "SAY: <two short spoken sentences: a fresh observation plus one question to start talking>",
+).strip()
+VISION_IDLE_COMBINED_HINT = os.environ.get(
+    "VISION_IDLE_COMBINED_HINT",
+    "Follow the NOTE/SAY format exactly. NOTE is internal context only. "
+    "SAY is read aloud—professional, no pet names, do not copy NOTE verbatim.",
+).strip()
+VISION_IDLE_SYNTHETIC_USER = os.environ.get(
+    "VISION_IDLE_SYNTHETIC_USER",
+    "(No speech detected — you are reaching out from the camera.)",
 ).strip()
 AMBIENT_SCENE_MAX_CHARS = max(
     200, int(os.environ.get("AMBIENT_SCENE_MAX_CHARS", "2000")),
@@ -191,6 +255,9 @@ SILENCE_THRESHOLD   = float(os.environ.get("VOICE_SILENCE_THRESHOLD", "0.012"))
 SILENCE_SECS        = float(os.environ.get("VOICE_SILENCE_SECS", "1.8"))
 MIN_SPEECH_SECS     = float(os.environ.get("VOICE_MIN_SPEECH_SECS", "0.25"))
 MAX_RECORD_SECS     = float(os.environ.get("VOICE_MAX_RECORD_SECS", "30"))
+VOICE_LISTEN_HEARTBEAT_SEC = max(
+    0.0, float(os.environ.get("VOICE_LISTEN_HEARTBEAT_SEC", "5")),
+)
 POST_PLAYBACK_SLEEP = float(os.environ.get("VOICE_POST_PLAYBACK_SLEEP", "0.25"))
 
 # Input device: unset = PortAudio default; int string = index; otherwise substring match on input device name
@@ -281,6 +348,12 @@ LLM_INTER_TOKEN_TIMEOUT = max(
 )
 LLM_RETRY_ATTEMPTS      = max(1, int(os.environ.get("VOICE_LLM_RETRY_ATTEMPTS", "3")))
 LLM_RETRY_BASE_SECS     = float(os.environ.get("VOICE_LLM_RETRY_BASE_SECS", "2"))
+LLM_HTTP_CONNECT_TIMEOUT = max(
+    5.0, float(os.environ.get("VOICE_LLM_HTTP_CONNECT_TIMEOUT", "30")),
+)
+LLM_HTTP_READ_TIMEOUT = max(
+    15.0, float(os.environ.get("VOICE_LLM_HTTP_READ_TIMEOUT", "90")),
+)
 
 # Conversation context & memory (env-tunable)
 MAX_HISTORY_PAIRS       = max(1, int(os.environ.get("VOICE_MAX_HISTORY_PAIRS", "12")))
@@ -399,6 +472,10 @@ def describe_default_input() -> str:
 def record_until_silence() -> Tuple[Optional[np.ndarray], str]:
     """Stream mic input; return (audio_or_None, status_message for logging)."""
     print("\n[Listening ...]", flush=True)
+    try:
+        sd.stop()
+    except Exception:
+        pass
 
     audio_chunks: List[np.ndarray] = []
     speech_chunks = 0
@@ -408,6 +485,8 @@ def record_until_silence() -> Tuple[Optional[np.ndarray], str]:
 
     silence_limit = int(SILENCE_SECS * SAMPLE_RATE / BLOCK_SIZE)
     min_speech    = max(1, int(MIN_SPEECH_SECS * SAMPLE_RATE / BLOCK_SIZE))
+    deadline = time.monotonic() + MAX_RECORD_SECS
+    last_heartbeat = time.monotonic()
 
     def callback(indata, frames, time_info, status):
         nonlocal silent_chunks, speech_chunks, has_speech
@@ -433,11 +512,28 @@ def record_until_silence() -> Tuple[Optional[np.ndarray], str]:
                 silent_chunks = 0
                 has_speech    = False
 
-    with sd.InputStream(
-        samplerate=SAMPLE_RATE, channels=CHANNELS,
-        blocksize=BLOCK_SIZE, dtype="float32", callback=callback,
-    ):
-        stopped_by_event = stop_event.wait(timeout=MAX_RECORD_SECS)
+    stopped_by_event = False
+    try:
+        with sd.InputStream(
+            samplerate=SAMPLE_RATE, channels=CHANNELS,
+            blocksize=BLOCK_SIZE, dtype="float32", callback=callback,
+        ):
+            while time.monotonic() < deadline:
+                if stop_event.wait(timeout=0.25):
+                    stopped_by_event = True
+                    break
+                now = time.monotonic()
+                if (
+                    VOICE_LISTEN_HEARTBEAT_SEC > 0
+                    and now - last_heartbeat >= VOICE_LISTEN_HEARTBEAT_SEC
+                ):
+                    print(
+                        f"[Listening ...] {max(0, deadline - now):.0f}s remaining",
+                        flush=True,
+                    )
+                    last_heartbeat = now
+    except Exception as exc:
+        return None, f"Microphone error: {exc}"
 
     if not has_speech:
         if stopped_by_event:
@@ -462,6 +558,10 @@ def record_until_silence() -> Tuple[Optional[np.ndarray], str]:
 
 def wait_after_playback() -> None:
     """Brief pause after TTS so room/speaker echo does not trigger VAD."""
+    try:
+        sd.stop()
+    except Exception:
+        pass
     if POST_PLAYBACK_SLEEP > 0:
         time.sleep(POST_PLAYBACK_SLEEP)
 
@@ -878,6 +978,7 @@ def _append_system_hint(msgs: List[Dict], hint: str) -> None:
 _vision_frame_history: List[Dict] = []
 _ambient_scene_notes: str = ""
 _last_idle_inspect_mono: float = 0.0
+_last_user_speech_mono: float = 0.0
 
 
 def clear_vision_frame_history() -> None:
@@ -927,6 +1028,67 @@ def drain_llm_stream(token_source: Iterator[str]) -> str:
     return "".join(token_source).strip()
 
 
+def _idle_opener_too_similar(opener: str, observation: str) -> bool:
+    """True if the opener mostly repeats the factual idle observation."""
+    o = opener.lower().strip()
+    obs = observation.lower().strip()
+    if not o or not obs:
+        return False
+    if len(obs) >= 24 and obs[:24] in o:
+        return True
+    obs_words = {w for w in obs.split() if len(w) > 3}
+    if len(obs_words) < 4:
+        return False
+    opener_words = set(o.split())
+    overlap = len(obs_words & opener_words) / len(obs_words)
+    return overlap >= 0.55
+
+
+def _fallback_idle_opener() -> str:
+    return VISION_IDLE_OPENER_FALLBACK or "What is on your mind?"
+
+
+def _parse_idle_combined_response(text: str) -> Tuple[str, str]:
+    """Split NOTE: / SAY: lines from a combined idle vision response."""
+    note_parts: List[str] = []
+    say_parts: List[str] = []
+    mode: Optional[str] = None
+    for line in str(text).splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        upper = stripped.upper()
+        if upper.startswith("NOTE:"):
+            mode = "note"
+            note_parts.append(stripped[5:].strip())
+        elif upper.startswith("SAY:"):
+            mode = "say"
+            say_parts.append(stripped[4:].strip())
+        elif mode == "note":
+            note_parts.append(stripped)
+        elif mode == "say":
+            say_parts.append(stripped)
+    note = " ".join(note_parts).strip()
+    say = " ".join(say_parts).strip()
+    if not note and not say:
+        return text.strip(), ""
+    return note, say
+
+
+def trim_conversation_turns(
+    conversation: List[Dict],
+    max_pairs: int = MAX_HISTORY_PAIRS,
+) -> List[Dict]:
+    """Drop oldest user/assistant pairs; keep the system message."""
+    if not conversation:
+        return conversation
+    head = [conversation[0]] if conversation[0].get("role") == "system" else []
+    rest = [m for m in conversation if m.get("role") != "system"]
+    while len(rest) > max_pairs * 2 and len(rest) >= 2:
+        rest = rest[2:]
+    return head + rest
+
+
 def append_vision_frame_history(user_text: str, image_b64: str) -> None:
     if VISION_MEMORY_FRAMES <= 0 or not image_b64:
         return
@@ -957,17 +1119,22 @@ def messages_for_llm_request(
     *,
     no_camera_vision: bool = False,
     extra_vision_turns: Optional[List[Dict]] = None,
+    retain_frame_images: bool = True,
 ) -> List[Dict]:
     """API payload: recent user turns may include stored camera frames."""
-    msgs = [copy_message_for_api(m) for m in conversation]
-    if extra_vision_turns:
+    if retain_frame_images:
+        msgs = [copy_message_for_api(m) for m in conversation]
+    else:
+        msgs = [message_to_text_only(m) for m in conversation]
+    if extra_vision_turns and retain_frame_images:
         hist = [copy_message_for_api(m) for m in extra_vision_turns]
         if msgs and msgs[-1].get("role") == "user":
             msgs = msgs[:-1] + hist + [msgs[-1]]
         else:
             msgs.extend(hist)
-    _retain_recent_frame_messages(msgs)
-    if image_b64 and msgs and msgs[-1].get("role") == "user":
+    if retain_frame_images:
+        _retain_recent_frame_messages(msgs)
+    if retain_frame_images and image_b64 and msgs and msgs[-1].get("role") == "user":
         user_text = extract_message_text(msgs[-1].get("content"))
         msgs[-1] = build_user_message(user_text, image_b64)
     has_images = messages_have_images(msgs)
@@ -1128,7 +1295,11 @@ def stream_llm(
             resp = None
             for attempt in range(LLM_RETRY_ATTEMPTS):
                 resp = llm.session.post(
-                    llm.chat_url, headers=headers, json=body, stream=True, timeout=30,
+                    llm.chat_url,
+                    headers=headers,
+                    json=body,
+                    stream=True,
+                    timeout=(LLM_HTTP_CONNECT_TIMEOUT, LLM_HTTP_READ_TIMEOUT),
                 )
                 if resp.status_code == 429 and attempt + 1 < LLM_RETRY_ATTEMPTS:
                     wait = LLM_RETRY_BASE_SECS * (2 ** attempt)
@@ -2329,54 +2500,158 @@ def maybe_idle_scene_inspect(
     record_status: str,
     vision_active: bool,
     memory_notes: str,
+    conversation: List[Dict],
     tts: "TTSEngine",
-) -> Tuple[bool, str]:
+) -> Tuple[bool, str, List[Dict], bool]:
     """
     On silence timeout (no mic input), capture a frame and note what is visible.
-    Updates ambient scene notes for later turns; optional brief TTS.
+    Optionally starts a new conversation with a spoken opener to invite discussion.
+    Returns (vision_active, memory_notes, conversation, last_turn_had_vision).
     """
-    global _last_idle_inspect_mono
+    global _last_idle_inspect_mono, _last_user_speech_mono
     if not VISION_IDLE_INSPECT or not record_status_is_silence_timeout(record_status):
-        return vision_active, memory_notes
+        return vision_active, memory_notes, conversation, False
     now = time.monotonic()
     if now - _last_idle_inspect_mono < VISION_IDLE_COOLDOWN_SEC:
-        return vision_active, memory_notes
+        return vision_active, memory_notes, conversation, False
     if not vision_active:
         vision_active = voice_vision.ensure_camera()
         if not vision_active:
-            return vision_active, memory_notes
+            return vision_active, memory_notes, conversation, False
     image_b64 = voice_vision.capture_snapshot()
     if not image_b64:
-        return vision_active, memory_notes
+        return vision_active, memory_notes, conversation, False
     _last_idle_inspect_mono = now
     print("[Vision]: idle listen — inspecting camera ...", flush=True)
     turn_llm = resolve_vision_llm_config()
-    user_msg = build_user_message(VISION_IDLE_INSPECT_PROMPT, image_b64)
-    msgs: List[Dict] = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        user_msg,
-    ]
-    _append_system_hint(msgs, VISION_IDLE_INSPECT_HINT)
-    try:
-        observation = drain_llm_stream(
-            stream_llm_vision_with_fallback(
-                msgs,
-                turn_llm,
-                max_tokens=VISION_IDLE_INSPECT_MAX_TOKENS,
+    skip_discussion = (
+        VISION_IDLE_MIN_QUIET_AFTER_SPEECH_SEC > 0
+        and _last_user_speech_mono > 0
+        and time.monotonic() - _last_user_speech_mono
+        < VISION_IDLE_MIN_QUIET_AFTER_SPEECH_SEC
+    )
+    observation = ""
+    opener = ""
+    last_turn_had_vision = False
+
+    if VISION_IDLE_PROMPT_DISCUSSION and not skip_discussion and VISION_IDLE_COMBINED:
+        combined_msgs: List[Dict] = [
+            build_system_message(SYSTEM_PROMPT, ""),
+            build_user_message(VISION_IDLE_COMBINED_PROMPT, image_b64),
+        ]
+        _append_system_hint(combined_msgs, VISION_IDLE_COMBINED_HINT)
+        _inject_ambient_scene_into_system(combined_msgs)
+        try:
+            raw = drain_llm_stream(
+                stream_llm_vision_with_fallback(
+                    combined_msgs,
+                    turn_llm,
+                    max_tokens=VISION_IDLE_DISCUSSION_MAX_TOKENS,
+                )
             )
-        )
-    except Exception as exc:
-        print(f"[Vision]: idle inspect failed ({exc})", flush=True)
-        return vision_active, memory_notes
-    if not observation:
+        except Exception as exc:
+            print(f"[Vision]: idle inspect failed ({exc})", flush=True)
+            return vision_active, memory_notes, conversation, False
+        observation, opener = _parse_idle_combined_response(raw)
+        if not observation and raw:
+            observation = raw
+    else:
+        user_msg = build_user_message(VISION_IDLE_INSPECT_PROMPT, image_b64)
+        msgs: List[Dict] = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            user_msg,
+        ]
+        _append_system_hint(msgs, VISION_IDLE_INSPECT_HINT)
+        try:
+            observation = drain_llm_stream(
+                stream_llm_vision_with_fallback(
+                    msgs,
+                    turn_llm,
+                    max_tokens=VISION_IDLE_INSPECT_MAX_TOKENS,
+                )
+            )
+        except Exception as exc:
+            print(f"[Vision]: idle inspect failed ({exc})", flush=True)
+            return vision_active, memory_notes, conversation, False
+
+    if not observation and not opener:
         print("[Vision]: idle inspect returned nothing.", flush=True)
-        return vision_active, memory_notes
-    append_ambient_scene_note(observation)
-    print(f"[Vision]: idle scene — {observation}", flush=True)
-    if VISION_IDLE_INSPECT_SPEAK:
+        return vision_active, memory_notes, conversation, False
+    if observation:
+        append_ambient_scene_note(observation)
+        print(f"[Vision]: idle scene — {observation}", flush=True)
+
+    if VISION_IDLE_PROMPT_DISCUSSION and not skip_discussion and not opener:
+        if "{observation}" in VISION_IDLE_DISCUSSION_PROMPT:
+            discuss_prompt = VISION_IDLE_DISCUSSION_PROMPT.replace(
+                "{observation}", observation,
+            )
+        else:
+            discuss_prompt = (
+                f"{VISION_IDLE_DISCUSSION_PROMPT.rstrip()}\n\nWhat you noticed: {observation}"
+            )
+        discuss_msgs: List[Dict] = [
+            build_system_message(SYSTEM_PROMPT, ""),
+            build_user_message(discuss_prompt, image_b64),
+        ]
+        _append_system_hint(discuss_msgs, VISION_IDLE_DISCUSSION_HINT)
+        _inject_ambient_scene_into_system(discuss_msgs)
+        try:
+            opener = drain_llm_stream(
+                stream_llm_vision_with_fallback(
+                    discuss_msgs,
+                    turn_llm,
+                    max_tokens=VISION_IDLE_DISCUSSION_MAX_TOKENS,
+                )
+            )
+        except Exception as exc:
+            print(f"[Vision]: idle discussion opener failed ({exc})", flush=True)
+            opener = ""
+        if opener and _idle_opener_too_similar(opener, observation):
+            print("[Vision]: idle opener repeated observation — retrying ...", flush=True)
+            retry_msgs: List[Dict] = [
+                build_system_message(SYSTEM_PROMPT, ""),
+                build_user_message(
+                    "Give a NEW spoken opener. Do not repeat these notes:\n"
+                    f"{observation}\n\nOne short line plus one question only.",
+                    image_b64,
+                ),
+            ]
+            _append_system_hint(retry_msgs, VISION_IDLE_DISCUSSION_HINT)
+            try:
+                opener = drain_llm_stream(
+                    stream_llm_vision_with_fallback(
+                        retry_msgs, turn_llm, max_tokens=VISION_IDLE_DISCUSSION_MAX_TOKENS,
+                    )
+                )
+            except Exception:
+                opener = ""
+            if opener and _idle_opener_too_similar(opener, observation):
+                opener = _fallback_idle_opener()
+    if opener and observation and _idle_opener_too_similar(opener, observation):
+        opener = _fallback_idle_opener()
+    if opener:
+        if VISION_IDLE_FRESH_CONVERSATION:
+            conversation, memory_notes = fresh_conversation()
+            if not memory_active():
+                clear_vision_frame_history()
+        synth_user = VISION_IDLE_SYNTHETIC_USER or "(Idle — camera reach-out.)"
+        conversation.append(build_user_message(synth_user, image_b64))
+        conversation.append({"role": "assistant", "content": opener})
+        append_vision_frame_history(synth_user, image_b64)
+        print("[Vision]: idle conversation opener.", flush=True)
+        tts.speak(opener)
+        wait_after_playback()
+        last_turn_had_vision = True
+        mem_path = effective_memory_path()
+        if mem_path:
+            schedule_save_memory_file(mem_path, memory_notes, conversation)
+        return vision_active, memory_notes, conversation, last_turn_had_vision
+
+    if VISION_IDLE_INSPECT_SPEAK and observation:
         tts.speak(observation)
         wait_after_playback()
-    return vision_active, memory_notes
+    return vision_active, memory_notes, conversation, last_turn_had_vision
 
 
 def wipe_all_agent_memory(base_system_prompt: str, memory_path: str) -> Tuple[List[Dict], str]:
@@ -2525,11 +2800,18 @@ def main() -> None:
                     flush=True,
                 )
             if VISION_IDLE_INSPECT:
+                idle_mode = (
+                    "start conversation from observation"
+                    if VISION_IDLE_PROMPT_DISCUSSION
+                    else (
+                        "speak observation"
+                        if VISION_IDLE_INSPECT_SPEAK
+                        else "silent context only"
+                    )
+                )
                 print(
                     f"[Vision]: idle inspect on silence timeout "
-                    f"(cooldown {VISION_IDLE_COOLDOWN_SEC:g}s"
-                    + (", may speak" if VISION_IDLE_INSPECT_SPEAK else ", silent")
-                    + ").",
+                    f"(cooldown {VISION_IDLE_COOLDOWN_SEC:g}s, {idle_mode}).",
                     flush=True,
                 )
         else:
@@ -2559,10 +2841,16 @@ def main() -> None:
             if audio is None:
                 print(f"[Listen skipped]: {record_status}", flush=True)
                 if vision_enabled:
-                    vision_active, memory_notes = maybe_idle_scene_inspect(
+                    (
+                        vision_active,
+                        memory_notes,
+                        conversation,
+                        last_turn_had_vision,
+                    ) = maybe_idle_scene_inspect(
                         record_status=record_status,
                         vision_active=vision_active,
                         memory_notes=memory_notes,
+                        conversation=conversation,
                         tts=tts,
                     )
                 continue
@@ -2576,6 +2864,7 @@ def main() -> None:
                 print("[No speech detected, listening again]", flush=True)
                 continue
             print(f"[You]: {user_text}", flush=True)
+            _last_user_speech_mono = time.monotonic()
 
             if user_wants_memory_disabled(user_text):
                 set_session_memory_enabled(False)
@@ -2650,23 +2939,24 @@ def main() -> None:
                     max_context_chars=MAX_CONTEXT_CHARS,
                 )
             else:
-                conversation, memory_notes = fresh_conversation()
                 if image_b64:
                     conversation.append(build_user_message(user_text, image_b64))
                 else:
                     conversation.append({"role": "user", "content": user_text})
-            frame_hist = (
-                None
-                if memory_active()
-                else (list(_vision_frame_history) if _vision_frame_history else None)
-            )
+                conversation = trim_conversation_turns(conversation)
+            retain_frames = vision_wanted
+            api_image = image_b64 if vision_wanted else None
+            frame_hist = None
+            if retain_frames and not memory_active() and _vision_frame_history:
+                frame_hist = list(_vision_frame_history)
             api_messages = messages_for_llm_request(
                 conversation,
-                image_b64,
+                api_image,
                 no_camera_vision=no_camera_vision,
                 extra_vision_turns=frame_hist,
+                retain_frame_images=retain_frames,
             )
-            use_vision_llm = messages_have_images(api_messages)
+            use_vision_llm = retain_frames and messages_have_images(api_messages)
             turn_llm = pick_llm_for_turn(use_vision_llm, llm_config)
             frame_count = sum(1 for m in api_messages if message_has_image(m))
             if vision_enabled:

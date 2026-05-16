@@ -1,31 +1,7 @@
 {
   "version": 1,
-  "memory_notes": "User: A.\nAssistant: What would youlike to talk about?\n\nUser: Hmm.\nAssistant: Understandingthe basics of this topic will help you get started quickly. If you have any specific questions, feel free to ask.\n\nUser: Okay.\nAssistant: What would you like to do next?\n\nUser: Tell me what you see.\nAssistant: I see a bald man in a black shirt wearing an orange scarf sitting in a room. Behind him is a bed with gray bedding and a blue storage bin, and slippers are on the floor.\n\nUser: Okay. Who is it with you and what can actually you do? I call it. That's not a micro golf. What is a micro golf? Come come, we're going to some hotel. No, no, no, no, no, no, no, no, no\nAssistant: I'm with you,and I can chat, listen, and help you with anything you need. Micro golf is a short, mini version of regular golf played on a compact course.\n\nUser: What can you see?\nAssistant: I see a bald man in a black shirt using a lighter on something in his hands. He is sitting in a room with a bed and some other items in the background.\n\nUser: What else can you see?\nAssistant: I see he's wearing bracelets on his left wrist. There's a bed with a gray and white striped blanket behind him and a blue bin on a shelf in the background. I also notice some slippers on the floor.\n\nUser: Okay. So what more can you see?\nAssistant: Okay, I also see a black object, maybe a remote, on the bed. There appears to be a light switch on the wall and a few items stored above the blue bin. Anything else you would like me to look for?\n\nUser: Carry on looking.\nAssistant: Okay, looking closer, I can see a black cat sleeping on the bed behind the man. There's also a cord running along the floor near the bed. Is there anything specific you want me to focus on?",
+  "memory_notes": "User: A.\nAssistant: What would youlike to talk about?\n\nUser: Hmm.\nAssistant: Understandingthe basics of this topic will help you get started quickly. If you have any specific questions, feel free to ask.\n\nUser: Okay.\nAssistant: What would you like to do next?\n\nUser: Tell me what you see.\nAssistant: I see a bald man in a black shirt wearing an orange scarf sitting in a room. Behind him is a bed with gray bedding and a blue storage bin, and slippers are on the floor.\n\nUser: Okay. Who is it with you and what can actually you do? I call it. That's not a micro golf. What is a micro golf? Come come, we're going to some hotel. No, no, no, no, no, no, no, no, no\nAssistant: I'm with you,and I can chat, listen, and help you with anything you need. Micro golf is a short, mini version of regular golf played on a compact course.\n\nUser: What can you see?\nAssistant: I see a bald man in a black shirt using a lighter on something in his hands. He is sitting in a room with a bed and some other items in the background.\n\nUser: What else can you see?\nAssistant: I see he's wearing bracelets on his left wrist. There's a bed with a gray and white striped blanket behind him and a blue bin on a shelf in the background. I also notice some slippers on the floor.\n\nUser: Okay. So what more can you see?\nAssistant: Okay, I also see a black object, maybe a remote, on the bed. There appears to be a light switch on the wall and a few items stored above the blue bin. Anything else you would like me to look for?\n\nUser: Carry on looking.\nAssistant: Okay, looking closer, I can see a black cat sleeping on the bed behind the man. There's also a cord running along the floor near the bed. Is there anything specific you want me to focus on?\n\nUser: Something more about the cat.\nAssistant: The cat appears to be a solid black cat and is lying on the bed, possibly sleeping. It is positioned toward the back of the bed, closer to the headboard.\n\nUser: Okay. Now am I sitting down or am I sitting in front of you?\nAssistant: Based on the image, it looks like you are sitting down. You appear to be sitting in a chair in the room.\n\nUser: Okay.\nAssistant: It seems like there's a bit of a pause. Is there something you'd like to talk about or ask me?",
   "turns": [
-    {
-      "role": "user",
-      "content": "Something more about the cat."
-    },
-    {
-      "role": "assistant",
-      "content": "The cat appears to be a solid black cat and is lying on the bed, possibly sleeping. It is positioned toward the back of the bed, closer to the headboard."
-    },
-    {
-      "role": "user",
-      "content": "Okay. Now am I sitting down or am I sitting in front of you?"
-    },
-    {
-      "role": "assistant",
-      "content": "Based on the image, it looks like you are sitting down. You appear to be sitting in a chair in the room."
-    },
-    {
-      "role": "user",
-      "content": "Okay."
-    },
-    {
-      "role": "assistant",
-      "content": "It seems like there's a bit of a pause. Is there something you'd like to talk about or ask me?"
-    },
     {
       "role": "user",
       "content": "Goodbye."
@@ -65,6 +41,46 @@
     {
       "role": "assistant",
       "content": "Looking closer, I see the man is wearing an orange scarf. He has bracelets on his left wrist and he's holding something in his hand. I also see a black object, possibly a remote control, on the bed, and there's a light switch on the wall."
+    },
+    {
+      "role": "user",
+      "content": "The."
+    },
+    {
+      "role": "assistant",
+      "content": "It looks like you're about to say something, but it's cut off. Would you like to finish your thought?"
+    },
+    {
+      "role": "user",
+      "content": "Yeah okay."
+    },
+    {
+      "role": "assistant",
+      "content": "There's not much to see right now, the scene is pretty still. The cat is sleeping, and the man is just sitting there."
+    },
+    {
+      "role": "user",
+      "content": "Where's the cat sleeping?"
+    },
+    {
+      "role": "assistant",
+      "content": "The cat is sleeping on the bed, positioned toward the back, closer to the headboard."
+    },
+    {
+      "role": "user",
+      "content": "(No speech detected — you are reaching out from the camera.)"
+    },
+    {
+      "role": "assistant",
+      "content": "You look like you are deep in thought about something. Is there anything you want to talk about?"
+    },
+    {
+      "role": "user",
+      "content": "(No speech detected — you are reaching out from the camera.)"
+    },
+    {
+      "role": "assistant",
+      "content": "You look like you are deep in thought about something important. Is everything going okay with your work today?"
     }
   ]
 }
